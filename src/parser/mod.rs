@@ -556,21 +556,7 @@ fn name_pdf(input: ParserInput) -> NomResult<'_, PdfName> {
 }
 
 fn dictionary_key(input: ParserInput) -> NomResult<'_, PdfName> {
-    let Some(rest) = input.strip_prefix(b"/") else {
-        return Err(ParseErr::Error(NomError::from_error_kind(
-            input,
-            ErrorKind::Tag,
-        )));
-    };
-    let mut end = 0;
-    while end < rest.len() && rest[end] != b'#' && is_regular(rest[end]) {
-        end += 1;
-    }
-    if end == rest.len() || rest[end] != b'#' {
-        return Ok((&rest[end..], PdfName::new(&rest[..end])));
-    }
-    let (rest, bytes) = name(input)?;
-    Ok((rest, PdfName::new(bytes)))
+    name_pdf(input)
 }
 
 fn inner_dictionary(depth: usize) -> impl Fn(ParserInput) -> NomResult<Dictionary> {
@@ -787,23 +773,20 @@ fn unsigned_int<I: UnsignedToken>(input: ParserInput) -> NomResult<I> {
     let bytes = input;
     let mut index = 0;
     let mut value = 0u64;
-    let mut overflow = false;
     while let Some(&byte) = bytes.get(index) {
         if !byte.is_ascii_digit() {
             break;
         }
-        if !overflow {
-            match value
-                .checked_mul(10)
-                .and_then(|value| value.checked_add(u64::from(byte - b'0')))
-            {
-                Some(next) => value = next,
-                None => overflow = true,
-            }
-        }
+        value = value.wrapping_mul(10).wrapping_add(u64::from(byte - b'0'));
         index += 1;
     }
-    if index == 0 || overflow {
+    if index == 0 {
+        return Err(ParseErr::Error(NomError::from_error_kind(
+            input,
+            ErrorKind::MapRes,
+        )));
+    }
+    if index > 19 {
         return Err(ParseErr::Error(NomError::from_error_kind(
             input,
             ErrorKind::MapRes,
@@ -1418,33 +1401,23 @@ fn number(input: ParserInput) -> NomResult<Object> {
         _ => false,
     };
     let digits_start = index;
-    let mut value = 0u64;
-    let mut overflow = false;
+    let mut value = 0i64;
     while let Some(&byte) = bytes.get(index) {
         if !byte.is_ascii_digit() {
             break;
         }
-        if !overflow {
-            match value
-                .checked_mul(10)
-                .and_then(|value| value.checked_add(u64::from(byte - b'0')))
-            {
-                Some(next) => value = next,
-                None => overflow = true,
-            }
-        }
+        value = value.wrapping_mul(10).wrapping_add(i64::from(byte - b'0'));
         index += 1;
     }
     if bytes.get(index) == Some(&b'.') {
         return real(input).map(|(rest, value)| (rest, Object::Real(value)));
     }
-    if index > digits_start && !overflow {
-        let signed = if negative {
-            (value as i64).wrapping_neg()
-        } else {
-            value as i64
-        };
-        return Ok((&bytes[index..], Object::Integer(signed)));
+    let digits = index - digits_start;
+    if digits > 0 && digits <= 18 {
+        return Ok((
+            &bytes[index..],
+            Object::Integer(if negative { -value } else { value }),
+        ));
     }
     integer(input).map(|(rest, value)| (rest, Object::Integer(value)))
 }
