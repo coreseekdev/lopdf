@@ -1864,7 +1864,7 @@ impl<'a> Reader<'a> {
                 .par_iter()
                 .map(entries_filter_map)
                 .filter_map(Result::transpose)
-                .collect::<Result<BTreeMap<_, _>>>()?;
+                .collect::<Result<crate::ObjectStore>>()?;
         }
         #[cfg(not(feature = "rayon"))]
         {
@@ -1875,12 +1875,12 @@ impl<'a> Reader<'a> {
                 .iter()
                 .map(entries_filter_map)
                 .filter_map(Result::transpose)
-                .collect::<Result<BTreeMap<_, _>>>()?;
+                .collect::<Result<crate::ObjectStore>>()?;
         }
 
         // Only add entries, but never replace entries
         for (id, entry) in object_streams.into_inner().unwrap() {
-            self.document.objects.entry(id).or_insert(entry);
+            if !self.document.objects.contains_key(&id) { self.document.objects.insert(id, entry); }
         }
 
         for object_id in zero_length_streams.into_inner().unwrap() {

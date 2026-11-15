@@ -11,6 +11,7 @@ pub mod xref;
 #[macro_use]
 mod object;
 mod document;
+mod object_store;
 mod incremental_document;
 
 mod bookmarks;
@@ -38,6 +39,7 @@ mod font;
 
 pub use document::Document;
 pub use object::{Dictionary, Object, ObjectId, PdfName, PdfString, Stream, StringFormat};
+pub use object_store::ObjectStore;
 
 pub use bookmarks::Bookmark;
 pub use common_data_structures::{decode_text_string, text_string};

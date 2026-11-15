@@ -2,6 +2,7 @@ use super::encodings::Encoding;
 use super::{Bookmark, Dictionary, Object, ObjectId};
 use crate::encryption::crypt_filters::*;
 use crate::encryption::{self, EncryptionState, PasswordAlgorithm};
+use crate::object_store::ObjectStore;
 use crate::xobject::PdfImage;
 use crate::xref::{Xref, XrefType};
 use crate::{DecompressError, Error, ObjectStream, Result, Stream};
@@ -41,7 +42,7 @@ pub struct Document {
     pub reference_table: Xref,
 
     /// The objects that make up the document contained in the file.
-    pub objects: BTreeMap<ObjectId, Object>,
+    pub objects: ObjectStore,
 
     /// Current maximum object id within the document.
     pub max_id: u32,
@@ -103,7 +104,7 @@ impl Document {
             binary_mark: vec![0xBB, 0xAD, 0xC0, 0xDE],
             trailer,
             reference_table: Xref::new(0, cross_reference_type),
-            objects: BTreeMap::new(),
+            objects: ObjectStore::new(),
             max_id,
             max_bookmark_id,
             bookmarks: Vec::new(),
@@ -565,7 +566,7 @@ impl Document {
 
         // Only add entries, but never replace entries
         for (id, entry) in object_streams {
-            self.objects.entry(id).or_insert(entry);
+            if !self.objects.contains_key(&id) { self.objects.insert(id, entry); }
         }
 
         let object_id = self.trailer.remove(b"Encrypt").unwrap().as_reference()?;
