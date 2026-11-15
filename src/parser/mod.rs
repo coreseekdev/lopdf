@@ -1159,61 +1159,49 @@ fn _indirect_object<'a>(
 }
 
 pub fn header(input: ParserInput, strict: bool) -> Option<String> {
-    // Parse the version digits separately from trailing bytes: some generators put binary
-    // markers on the header line. Strict mode rejects them, lenient mode skips them.
-    if let Ok((_, (version_raw, trailing))) = delimited(
-        tag(&b"%PDF-"[..]),
-        pair(
-            take_while(|c: u8| c.is_ascii_digit() || c == b'.'),
-            take_while(|c: u8| !b"\r\n".contains(&c)),
-        ),
-        pair(eol, many0_count(comment)),
-    )
-    .parse(input)
-    {
+    if let Some(rest) = input.strip_prefix(b"%PDF-") {
+        let mut version_end = 0;
+        while rest
+            .get(version_end)
+            .is_some_and(|byte| byte.is_ascii_digit() || *byte == b'.')
+        {
+            version_end += 1;
+        }
+        let line_end = rest
+            .iter()
+            .position(|byte| matches!(*byte, b'\r' | b'\n'))
+            .unwrap_or(rest.len());
+        if line_end == rest.len() {
+            return None;
+        }
+        let trailing = &rest[version_end..line_end];
         if strict && !trailing.is_empty() {
             return None;
         }
-
-        // Torcular recovery: some damaged generators emit `%PDF-` with no
-        // version digits at all.  Default to a modern version so the rest of
-        // the recovery machinery runs.
-        if version_raw.is_empty() {
+        let version = &rest[..version_end];
+        if version.is_empty() {
             return Some("1.7".to_string());
         }
-
-        return str::from_utf8(version_raw).ok().map(|v| v.to_string());
+        return str::from_utf8(version).ok().map(|version| version.to_string());
     }
-
-    // Torcular recovery: a bare `%PDF` header with no dash and no version
-    // (pdfium tolerates this and repairs the rest of the file).  Strict mode
-    // keeps rejecting it.
-    delimited(
-        tag(&b"%PDF"[..]),
-        take_while(|c: u8| !b"\r\n".contains(&c)),
-        pair(eol, many0_count(comment)),
-    )
-    .parse(input)
-    .ok()?;
-    if strict {
+    if strict || !input.starts_with(b"%PDF") {
         return None;
     }
-    Some("1.7".to_string())
+    let line_end = input
+        .iter()
+        .position(|byte| matches!(*byte, b'\r' | b'\n'))
+        .unwrap_or(input.len());
+    (line_end < input.len()).then(|| "1.7".to_string())
 }
 
 pub fn binary_mark(input: ParserInput) -> Option<Vec<u8>> {
-    strip_nom(
-        map_res(
-            delimited(
-                tag(&b"%"[..]),
-                take_while(|c: u8| !b"\r\n".contains(&c)),
-                pair(eol, many0_count(comment)),
-            ),
-            |v: ParserInput| Ok::<Vec<u8>, ()>(v.to_vec()),
-        )
-        .parse(input),
-    )
+    let rest = input.strip_prefix(b"%")?;
+    let end = rest
+        .iter()
+        .position(|byte| matches!(*byte, b'\r' | b'\n'))?;
+    Some(rest[..end].to_vec())
 }
+
 
 /// Decode CrossReferenceTable
 fn xref(input: ParserInput, strict: bool) -> NomResult<Xref> {
