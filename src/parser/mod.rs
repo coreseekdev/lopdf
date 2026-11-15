@@ -877,27 +877,146 @@ fn reference(input: ParserInput) -> NomResult<Object> {
     map(terminated(object_id, tag(&b"R"[..])), Object::Reference).parse(input)
 }
 
-fn _direct_objects(depth: usize) -> impl Fn(ParserInput) -> NomResult<Object> {
-    move |input| match input.first() {
+#[inline]
+fn direct_reference_start(input: ParserInput) -> bool {
+    let mut index = 0;
+    while input.get(index).is_some_and(u8::is_ascii_digit) {
+        index += 1;
+    }
+    if index == 0 {
+        return false;
+    }
+    let spaces = input[index..]
+        .iter()
+        .take_while(|byte| byte.is_ascii_whitespace())
+        .count();
+    if spaces == 0 {
+        return false;
+    }
+    index += spaces;
+    let digits = input[index..]
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if digits == 0 {
+        return false;
+    }
+    index += digits;
+    let spaces = input[index..]
+        .iter()
+        .take_while(|byte| byte.is_ascii_whitespace())
+        .count();
+    if spaces == 0 {
+        return false;
+    }
+    index += spaces;
+    input.get(index) == Some(&b'R')
+        && input
+            .get(index + 1)
+            .is_none_or(|byte| !is_regular(*byte))
+}
+
+fn direct_reference(input: ParserInput) -> NomResult<Object> {
+    let (rest, number) = unsigned_int::<u32>(input)?;
+    let (rest, _) = space(rest)?;
+    let (rest, generation) = unsigned_int::<u16>(rest)?;
+    let (rest, _) = space(rest)?;
+    let Some(rest) = rest.strip_prefix(b"R") else {
+        return Err(nom::Err::Error(NomError::from_error_kind(
+            rest,
+            ErrorKind::Tag,
+        )));
+    };
+    Ok((rest, Object::Reference((number, generation))))
+}
+
+fn direct_array(input: ParserInput, depth: usize) -> NomResult<Vec<Object>> {
+    let Some(rest) = input.strip_prefix(b"[") else {
+        return Err(nom::Err::Error(NomError::from_error_kind(
+            input,
+            ErrorKind::Tag,
+        )));
+    };
+    let mut rest = space(rest)?.0;
+    let mut items = Vec::new();
+    loop {
+        if rest.starts_with(b"]") {
+            return Ok((&rest[1..], items));
+        }
+        if rest.starts_with(b">>") || rest.starts_with(b"endobj") {
+            return Ok((rest, items));
+        }
+        let (next, item) = direct_value(rest, depth - 1)?;
+        items.push(item);
+        rest = space(next)?.0;
+    }
+}
+
+fn direct_dictionary(input: ParserInput, depth: usize) -> NomResult<Dictionary> {
+    let Some(rest) = input.strip_prefix(b"<<") else {
+        return Err(nom::Err::Error(NomError::from_error_kind(
+            input,
+            ErrorKind::Tag,
+        )));
+    };
+    let mut rest = space(rest)?.0;
+    let mut dict = Dictionary::with_capacity(4);
+    loop {
+        if rest.starts_with(b">>") {
+            return Ok((&rest[2..], dict));
+        }
+        if rest.starts_with(b"endobj") {
+            return Ok((rest, dict));
+        }
+        let (next, key) = name_pdf(rest)?;
+        let (next, _) = space(next)?;
+        let (next, value) = direct_value(next, depth - 1)?;
+        dict.set(key, value);
+        rest = space(next)?.0;
+    }
+}
+
+fn direct_value(input: ParserInput, depth: usize) -> NomResult<Object> {
+    if depth == 0 {
+        return Err(nom::Err::Failure(NomError::from_error_kind(
+            input,
+            ErrorKind::TooLarge,
+        )));
+    }
+    match input.first() {
         Some(b'/') => map(name_pdf, Object::Name).parse(input),
-        Some(b'(') => map(literal_string_pdf, |s| Object::String(s, StringFormat::Literal)).parse(input),
+        Some(b'(') => map(literal_string_pdf, |string| {
+            Object::String(string, StringFormat::Literal)
+        })
+        .parse(input),
         Some(b'<') => {
             if input.get(1) == Some(&b'<') {
-                map(_dictionary(depth), Object::Dictionary).parse(input)
+                map(|i| direct_dictionary(i, depth), Object::Dictionary).parse(input)
             } else {
                 hexadecimal_string(input)
             }
         }
-        Some(b'[') => map(array(depth), Object::Array).parse(input),
-        Some(b't' | b'f') => boolean(input),
-        Some(b'n') => null(input),
-        Some(b'0'..=b'9') => reference(input).or_else(|_| number(input)),
+        Some(b'[') => map(|i| direct_array(i, depth), Object::Array).parse(input),
+        Some(b't') if input.starts_with(b"true") => Ok((&input[4..], Object::Boolean(true))),
+        Some(b'f') if input.starts_with(b"false") => Ok((&input[5..], Object::Boolean(false))),
+        Some(b'n') if input.starts_with(b"null") => Ok((&input[4..], Object::Null)),
+        Some(b'0'..=b'9') => {
+            if direct_reference_start(input) {
+                direct_reference(input)
+            } else {
+                number(input)
+            }
+        }
         Some(b'+' | b'-' | b'.') => number(input),
         _ => Err(nom::Err::Error(NomError::from_error_kind(
             input,
             ErrorKind::Alt,
         ))),
     }
+}
+
+fn _direct_objects(depth: usize) -> impl Fn(ParserInput) -> NomResult<Object> {
+    move |input| direct_value(input, depth)
 }
 
 fn _direct_object(depth: usize) -> impl Fn(ParserInput) -> NomResult<Object> {
@@ -908,7 +1027,9 @@ fn _direct_object(depth: usize) -> impl Fn(ParserInput) -> NomResult<Object> {
                 ErrorKind::TooLarge,
             )));
         }
-        terminated(_direct_objects(depth - 1), space).parse(input)
+        let (rest, value) = direct_value(input, depth - 1)?;
+        let (rest, _) = space(rest)?;
+        Ok((rest, value))
     }
 }
 
