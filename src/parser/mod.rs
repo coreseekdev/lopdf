@@ -206,6 +206,7 @@ fn integer(input: ParserInput) -> NomResult<i64> {
     Ok((rest, value))
 }
 
+#[inline]
 fn real(input: ParserInput) -> NomResult<f32> {
     let bytes = input.as_bytes();
     let mut offset = 0usize;
@@ -488,6 +489,7 @@ fn hexadecimal_string(input: ParserInput) -> NomResult<Object> {
     )))
 }
 
+#[inline]
 fn boolean(input: ParserInput) -> NomResult<Object> {
     alt((
         map(tag(&b"true"[..]), |_| Object::Boolean(true)),
@@ -496,6 +498,7 @@ fn boolean(input: ParserInput) -> NomResult<Object> {
     .parse(input)
 }
 
+#[inline]
 fn null(input: ParserInput) -> NomResult<Object> {
     map(tag(&b"null"[..]), |_| Object::Null).parse(input)
 }
@@ -1254,6 +1257,7 @@ fn intern_operator(operator: &str) -> Cow<'static, str> {
 
 /// Decides between the real and integer grammar after one dot scan; the
 /// selected parser then produces the exact same value as before.
+#[inline]
 fn number(input: ParserInput) -> NomResult<Object> {
     let bytes = input;
     let mut index = 0;
@@ -1300,6 +1304,7 @@ fn number(input: ParserInput) -> NomResult<Object> {
     map(integer, Object::Integer).parse(input)
 }
 
+#[inline]
 fn operand_value(input: ParserInput) -> NomResult<Object> {
     match input.first() {
         Some(b'/') => map(name, |bytes| Object::Name(bytes.into())).parse(input),
@@ -1322,6 +1327,7 @@ fn operand_value(input: ParserInput) -> NomResult<Object> {
     }
 }
 
+#[inline]
 fn operand(input: ParserInput) -> NomResult<Object> {
     let (rest, object) = operand_value(input)?;
     let (rest, _) = content_space(rest)?;
