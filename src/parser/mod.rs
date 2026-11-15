@@ -730,6 +730,26 @@ fn recover_stream_length(input: ParserInput) -> Option<(ParserInput, ParserInput
     Some((&input[position + word_len..], &input[..data_end]))
 }
 
+#[inline]
+fn consume_eol(input: ParserInput) -> Option<ParserInput> {
+    if let Some(rest) = input.strip_prefix(b"\r\n") {
+        Some(rest)
+    } else if let Some(rest) = input.strip_prefix(b"\n") {
+        Some(rest)
+    } else {
+        input.strip_prefix(b"\r")
+    }
+}
+
+#[inline]
+fn skip_stream_space(input: ParserInput) -> ParserInput {
+    let count = input
+        .iter()
+        .take_while(|byte| matches!(**byte, b' ' | b'\t'))
+        .count();
+    &input[count..]
+}
+
 fn stream<'a>(
     input: ParserInput<'a>,
     reader: &Reader,
@@ -737,8 +757,21 @@ fn stream<'a>(
     recover_length: bool,
     recovery_bound: Option<usize>,
 ) -> NomResult<'a, Object> {
-    let (i, dict) =
-        terminated(dictionary, (space, tag(&b"stream"[..]), space0, eol)).parse(input)?;
+    let (rest, dict) = direct_dictionary(input, crate::reader::MAX_NESTING_DEPTH)?;
+    let rest = space(rest)?.0;
+    let Some(rest) = rest.strip_prefix(b"stream") else {
+        return Err(nom::Err::Error(NomError::from_error_kind(
+            rest,
+            ErrorKind::Tag,
+        )));
+    };
+    let rest = skip_stream_space(rest);
+    let Some(i) = consume_eol(rest) else {
+        return Err(nom::Err::Error(NomError::from_error_kind(
+            rest,
+            ErrorKind::Tag,
+        )));
+    };
 
     let declared_length = dict.get(b"Length").ok().and_then(|value| {
         if let Ok(id) = value.as_reference() {
@@ -753,20 +786,19 @@ fn stream<'a>(
 
     if let Some(length) = declared_length {
         if let Ok(length) = usize::try_from(length) {
-            if let Ok((remaining, data)) =
-                terminated(take(length), pair(opt(eol), tag(&b"endstream"[..]))).parse(i)
-            {
-                return Ok((remaining, Object::Stream(Stream::new(dict, data.to_vec()))));
+            if length <= i.len() {
+                let data = &i[..length];
+                let after = &i[length..];
+                if let Some(after) = after.strip_prefix(b"\r\n").or_else(|| after.strip_prefix(b"\n")).or_else(|| after.strip_prefix(b"\r")).or(Some(after)) {
+                    if let Some(remaining) = after.strip_prefix(b"endstream") {
+                        return Ok((remaining, Object::Stream(Stream::new(dict, data.to_vec()))));
+                    }
+                }
             }
         }
-        // A negative, non-numeric or out-of-range length is not fatal: it
-        // falls back to the terminator scan below (pdfium ReadStream treats
-        // a bad Length the same way, cpdf_syntax_parser.cpp:785-810).
     }
 
     if recover_length && !reader.strict {
-        // The scan must not cross into a neighbouring object, so it stops at
-        // the xref-derived bound: the first `i.len() - bound` bytes of `i`.
         let scan_end = recovery_bound.map_or(i.len(), |bound| i.len().saturating_sub(bound));
         match recover_stream_length(&i[..scan_end]) {
             Some((remaining, data)) => {
@@ -778,17 +810,12 @@ fn stream<'a>(
                 }
                 Ok((remaining, Object::Stream(Stream::new(dict, data.to_vec()))))
             }
-            // A declared length that cannot be satisfied leaves an empty
-            // stream rather than aborting the object (a malformed length is
-            // not fatal).  A missing length keeps the old zero-length
-            // placeholder.
             None => Ok((
                 i,
                 Object::Stream(Stream::with_position(dict, input.len() - i.len())),
             )),
         }
     } else if declared_length.is_none() {
-        // Return position relative to the start of the stream dictionary.
         Ok((
             i,
             Object::Stream(Stream::with_position(dict, input.len() - i.len())),
@@ -866,11 +893,11 @@ fn unsigned_int<I: UnsignedToken>(input: ParserInput) -> NomResult<I> {
 }
 
 fn object_id(input: ParserInput) -> NomResult<ObjectId> {
-    pair(
-        terminated(unsigned_int, space),
-        terminated(unsigned_int, space),
-    )
-    .parse(input)
+    let (rest, number) = unsigned_int::<u32>(input)?;
+    let (rest, _) = space(rest)?;
+    let (rest, generation) = unsigned_int::<u16>(rest)?;
+    let (rest, _) = space(rest)?;
+    Ok((rest, (number, generation)))
 }
 
 fn reference(input: ParserInput) -> NomResult<Object> {
@@ -1044,22 +1071,21 @@ fn object<'a>(
     recover_stream_length: bool,
     recovery_bound: Option<usize>,
 ) -> NomResult<'a, Object> {
-    terminated(
-        alt((
-            |input| {
-                stream(
-                    input,
-                    reader,
-                    already_seen,
-                    recover_stream_length,
-                    recovery_bound,
-                )
-            },
-            _direct_objects(crate::reader::MAX_NESTING_DEPTH),
-        )),
-        space,
-    )
-    .parse(input)
+    match stream(
+        input,
+        reader,
+        already_seen,
+        recover_stream_length,
+        recovery_bound,
+    ) {
+        Ok(result) => Ok(result),
+        Err(nom::Err::Failure(error)) => Err(nom::Err::Failure(error)),
+        Err(_) => {
+            let (rest, value) = direct_value(input, crate::reader::MAX_NESTING_DEPTH)?;
+            let (rest, _) = space(rest)?;
+            Ok((rest, value))
+        }
+    }
 }
 
 pub fn indirect_object(
@@ -1097,9 +1123,14 @@ fn _indirect_object<'a>(
     recover_stream_length: bool,
     recovery_bound: Option<usize>,
 ) -> crate::Result<(ObjectId, Object)> {
-    let (i, (_, object_id)) = terminated((space, object_id), pair(tag(&b"obj"[..]), space))
-        .parse(input)
-        .map_err(|_| Error::IndirectObject { offset })?;
+    let (rest, _) = space(input).map_err(|_| Error::IndirectObject { offset })?;
+    let (rest, object_id) =
+        object_id(rest).map_err(|_| Error::IndirectObject { offset })?;
+    let rest = rest
+        .strip_prefix(b"obj")
+        .ok_or(Error::IndirectObject { offset })?;
+    let (rest, _) = space(rest).map_err(|_| Error::IndirectObject { offset })?;
+    let (i, object_id) = (rest, object_id);
     if let Some(expected_id) = expected_id
         && object_id != expected_id
     {
