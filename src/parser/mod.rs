@@ -2044,34 +2044,48 @@ fn find_inline_image_end(input: ParserInput) -> Option<usize> {
     None
 }
 
+fn skip_trailing_content_space(mut rest: ParserInput) -> ParserInput {
+    loop {
+        rest = skip_content_space(rest);
+        if rest.first() != Some(&b'%') {
+            return rest;
+        }
+        let end = rest
+            .iter()
+            .position(|byte| matches!(*byte, b'\r' | b'\n'))
+            .unwrap_or(rest.len());
+        rest = &rest[end..];
+    }
+}
+
 fn _content(input: ParserInput) -> NomResult<Content<Vec<Operation>>> {
-    let (mut rest, _) = content_space(input)?;
-    // Most operators are 10-30 bytes; preallocate so a long page stream does
-    // not repeatedly grow and copy the operation vector.  The estimate is
-    // deliberately conservative so small/hostile inputs do not over-allocate.
+    let mut rest = input;
     let mut operations = Vec::with_capacity(input.len() / 32);
+    let mut operands = Vec::new();
     loop {
         let len = rest.len();
-        match operation(rest) {
-            Ok((next, operation)) => {
-                // `many0` fails when its parser succeeds without consuming
-                // input.
+        match operation_into(rest, &mut operands) {
+            Ok((next, operator)) => {
                 if next.len() == len {
                     return Err(nom::Err::Error(NomError::from_error_kind(
                         rest,
                         ErrorKind::Many0,
                     )));
                 }
-                operations.push(operation);
+                operations.push(Operation {
+                    operator,
+                    operands: std::mem::take(&mut operands),
+                });
                 rest = next;
             }
             Err(nom::Err::Error(_)) => break,
             Err(error) => return Err(error),
         }
     }
-    let (rest, _) = many0(terminated(comment, content_space)).parse(rest)?;
+    let rest = skip_trailing_content_space(rest);
     Ok((rest, Content { operations }))
 }
+
 
 pub fn content(input: ParserInput) -> Option<Content<Vec<Operation>>> {
     strip_nom(_content.parse(input))
@@ -2159,14 +2173,13 @@ impl Iterator for ContentOperations<'_> {
             }
         }
         let len = self.input.len();
-        match operation(self.input) {
-            // `many0` fails when its parser succeeds without consuming input.
-            Ok((input, _)) if input.len() == len => self.fail(),
-            Ok((input, operation)) => {
+        let mut operands = Vec::new();
+        match operation_into(self.input, &mut operands) {
+            Ok((input, operator)) if input.len() == len => self.fail(),
+            Ok((input, operator)) => {
                 self.input = input;
-                Some(Ok(operation))
+                Some(Ok(Operation { operator, operands }))
             }
-            // `many0` stops at a recoverable error, and `content` ignores the rest.
             Err(nom::Err::Error(_)) => {
                 self.finished = true;
                 None
@@ -2177,9 +2190,8 @@ impl Iterator for ContentOperations<'_> {
 }
 
 pub fn content_strict(input: ParserInput) -> Result<Content<Vec<Operation>>, error::ParseError> {
-    let (rest, content) = _content
-        .parse(input)
-        .map_err(|_| error::ParseError::InvalidContentStream)?;
+    let (rest, content) =
+        _content(input).map_err(|_| error::ParseError::InvalidContentStream)?;
     if !rest.is_empty() {
         return Err(error::ParseError::InvalidContentStream);
     }
