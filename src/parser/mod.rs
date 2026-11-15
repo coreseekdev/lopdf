@@ -1,4 +1,4 @@
-use super::{Dictionary, Object, ObjectId, PdfName, Reader, Stream, StringFormat};
+use super::{Dictionary, Object, ObjectId, PdfName, PdfString, Reader, Stream, StringFormat};
 use crate::Error;
 use crate::content::*;
 use crate::error;
@@ -432,6 +432,25 @@ fn literal_body(
     Err(index)
 }
 
+fn literal_string_pdf(input: ParserInput) -> NomResult<PdfString> {
+    let Some(rest) = input.strip_prefix(b"(") else {
+        return Err(nom::Err::Error(NomError::from_error_kind(
+            input,
+            ErrorKind::Tag,
+        )));
+    };
+    let mut index = 0;
+    while index < rest.len() {
+        match rest[index] {
+            b')' => return Ok((&rest[index + 1..], PdfString::new(&rest[..index]))),
+            b'\\' | b'(' | b'\r' | b'\n' => break,
+            _ => index += 1,
+        }
+    }
+    let (rest, bytes) = literal_string(input)?;
+    Ok((rest, PdfString::new(bytes)))
+}
+
 fn literal_string(input: ParserInput) -> NomResult<Vec<u8>> {
     let Some(rest) = input.strip_prefix(b"(") else {
         return Err(nom::Err::Error(NomError::from_error_kind(
@@ -861,7 +880,7 @@ fn reference(input: ParserInput) -> NomResult<Object> {
 fn _direct_objects(depth: usize) -> impl Fn(ParserInput) -> NomResult<Object> {
     move |input| match input.first() {
         Some(b'/') => map(name_pdf, Object::Name).parse(input),
-        Some(b'(') => map(literal_string, Object::string_literal).parse(input),
+        Some(b'(') => map(literal_string_pdf, |s| Object::String(s, StringFormat::Literal)).parse(input),
         Some(b'<') => {
             if input.get(1) == Some(&b'<') {
                 map(_dictionary(depth), Object::Dictionary).parse(input)
@@ -1366,7 +1385,7 @@ fn number(input: ParserInput) -> NomResult<Object> {
 fn operand_value(input: ParserInput) -> NomResult<Object> {
     match input.first() {
         Some(b'/') => map(name_pdf, Object::Name).parse(input),
-        Some(b'(') => map(literal_string, Object::string_literal).parse(input),
+        Some(b'(') => map(literal_string_pdf, |s| Object::String(s, StringFormat::Literal)).parse(input),
         Some(b'<') => {
             if input.get(1) == Some(&b'<') {
                 map(dictionary, Object::Dictionary).parse(input)
