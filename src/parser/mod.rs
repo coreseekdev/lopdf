@@ -1312,49 +1312,36 @@ fn xref_entry(
 }
 
 fn trailer(input: ParserInput) -> NomResult<Dictionary> {
-    delimited(pair(tag(&b"trailer"[..]), space), dictionary, space).parse(input)
+    let rest = input
+        .strip_prefix(b"trailer")
+        .ok_or_else(|| nom::Err::Error(NomError::from_error_kind(input, ErrorKind::Tag)))?;
+    let (rest, _) = space(rest)?;
+    let (rest, dictionary) = direct_dictionary(rest, crate::reader::MAX_NESTING_DEPTH)?;
+    let (rest, _) = space(rest)?;
+    Ok((rest, dictionary))
 }
 
 pub fn xref_and_trailer(input: ParserInput, reader: &Reader) -> crate::Result<(Xref, Dictionary)> {
-    let xref_trailer = map(
-        pair(|i| xref(i, reader.strict), trailer),
-        |(mut xref, trailer): (Xref, Dictionary)| {
+    if let Ok((rest, mut xref)) = xref(input, reader.strict) {
+        if let Ok((_, trailer)) = trailer(rest) {
             match trailer.get(b"Size").and_then(Object::as_i64) {
                 Ok(size) => xref.size = size as u32,
-                // `/Size` is required, but some writers omit it.  The xref
-                // subsections still give a safe upper bound, and accepting the
-                // table is better than scanning the whole file and possibly
-                // picking a `trailer` keyword that is really stream payload.
                 Err(_) if !reader.strict => {
                     xref.size = xref.max_id().saturating_add(1);
                 }
                 Err(_) => return Err(error::ParseError::InvalidTrailer.into()),
             }
-            Ok((xref, trailer))
-        },
-    );
-    alt((
-        xref_trailer,
-        (|input| {
-            _indirect_object(input, 0, None, reader, &mut HashSet::new(), false, None)
-                .map(|(_, obj)| {
-                    let res = match obj {
-                        Object::Stream(stream) => {
-                            decode_xref_stream_with_limit(stream, reader.max_decompressed_size)
-                        }
-                        _ => Err(crate::error::ParseError::InvalidXref.into()),
-                    };
-                    (input, res)
-                })
-                .map_err(|_| {
-                    // artificial error kind is created to allow descriptive nom errors
-                    nom::Err::Error(NomError::from_error_kind(input, ErrorKind::Fail))
-                })
-        }),
-    ))
-    .parse(input)
-    .map(|(_, o)| o)
-    .map_err(|_| error::ParseError::InvalidTrailer)?
+            return Ok((xref, trailer));
+        }
+    }
+    let (_, object) =
+        _indirect_object(input, 0, None, reader, &mut HashSet::new(), false, None)?;
+    match object {
+        Object::Stream(stream) => {
+            decode_xref_stream_with_limit(stream, reader.max_decompressed_size)
+        }
+        _ => Err(crate::error::ParseError::InvalidXref.into()),
+    }
 }
 
 pub fn xref_start(input: ParserInput) -> Option<i64> {
