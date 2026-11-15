@@ -817,58 +817,55 @@ fn reference(input: ParserInput) -> NomResult<Object> {
     Ok((rest, Object::Reference(id)))
 }
 
-#[inline]
-fn direct_reference_start(input: ParserInput) -> bool {
-    let mut index = 0;
-    while input.get(index).is_some_and(u8::is_ascii_digit) {
+fn try_direct_reference(input: ParserInput) -> Option<(ParserInput, Object)> {
+    let mut index = 0usize;
+    let mut number = 0u64;
+    while let Some(byte) = input.get(index).copied().filter(u8::is_ascii_digit) {
+        number = number.checked_mul(10)?.checked_add(u64::from(byte - b'0'))?;
         index += 1;
     }
     if index == 0 {
-        return false;
+        return None;
     }
     let spaces = input[index..]
         .iter()
         .take_while(|byte| byte.is_ascii_whitespace())
         .count();
     if spaces == 0 {
-        return false;
+        return None;
     }
     index += spaces;
-    let digits = input[index..]
-        .iter()
-        .take_while(|byte| byte.is_ascii_digit())
-        .count();
-    if digits == 0 {
-        return false;
+    let mut generation = 0u64;
+    let start = index;
+    while let Some(byte) = input.get(index).copied().filter(u8::is_ascii_digit) {
+        generation = generation.checked_mul(10)?.checked_add(u64::from(byte - b'0'))?;
+        index += 1;
     }
-    index += digits;
+    if index == start {
+        return None;
+    }
     let spaces = input[index..]
         .iter()
         .take_while(|byte| byte.is_ascii_whitespace())
         .count();
     if spaces == 0 {
-        return false;
+        return None;
     }
     index += spaces;
-    input.get(index) == Some(&b'R')
-        && input
-            .get(index + 1)
-            .is_none_or(|byte| !is_regular(*byte))
+    if input.get(index) != Some(&b'R')
+        || input.get(index + 1).is_some_and(|byte| is_regular(*byte))
+    {
+        return None;
+    }
+    Some((
+        &input[index + 1..],
+        Object::Reference((
+            u32::try_from(number).ok()?,
+            u16::try_from(generation).ok()?,
+        )),
+    ))
 }
 
-fn direct_reference(input: ParserInput) -> NomResult<Object> {
-    let (rest, number) = unsigned_int::<u32>(input)?;
-    let (rest, _) = space(rest)?;
-    let (rest, generation) = unsigned_int::<u16>(rest)?;
-    let (rest, _) = space(rest)?;
-    let Some(rest) = rest.strip_prefix(b"R") else {
-        return Err(ParseErr::Error(NomError::from_error_kind(
-            rest,
-            ErrorKind::Tag,
-        )));
-    };
-    Ok((rest, Object::Reference((number, generation))))
-}
 
 fn direct_array(input: ParserInput, depth: usize) -> NomResult<Vec<Object>> {
     let Some(rest) = input.strip_prefix(b"[") else {
@@ -947,13 +944,10 @@ fn direct_value(input: ParserInput, depth: usize) -> NomResult<Object> {
         Some(b't') if input.starts_with(b"true") => Ok((&input[4..], Object::Boolean(true))),
         Some(b'f') if input.starts_with(b"false") => Ok((&input[5..], Object::Boolean(false))),
         Some(b'n') if input.starts_with(b"null") => Ok((&input[4..], Object::Null)),
-        Some(b'0'..=b'9') => {
-            if direct_reference_start(input) {
-                direct_reference(input)
-            } else {
-                number(input)
-            }
-        }
+        Some(b'0'..=b'9') => match try_direct_reference(input) {
+            Some((rest, reference)) => Ok((rest, reference)),
+            None => number(input),
+        },
         Some(b'+' | b'-' | b'.') => number(input),
         _ => Err(ParseErr::Error(NomError::from_error_kind(
             input,
