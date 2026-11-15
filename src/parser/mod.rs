@@ -1344,15 +1344,24 @@ pub fn xref_and_trailer(input: ParserInput, reader: &Reader) -> crate::Result<(X
     }
 }
 
+fn trim_leading_spaces(mut rest: ParserInput) -> ParserInput {
+    while rest.first() == Some(&b' ') {
+        rest = &rest[1..];
+    }
+    rest
+}
+
 pub fn xref_start(input: ParserInput) -> Option<i64> {
-    strip_nom(
-        delimited(
-            pair(tag(&b"startxref"[..]), preceded(opt(tag(&b" "[..])), eol)),
-            trim_spaces(integer),
-            (eol, tag(&b"%%EOF"[..]), space),
-        )
-        .parse(input),
-    )
+    let rest = input.strip_prefix(b"startxref")?;
+    let rest = rest.strip_prefix(b" ").unwrap_or(rest);
+    let rest = consume_eol(rest)?;
+    let rest = trim_leading_spaces(rest);
+    let (rest, offset) = integer(rest).ok()?;
+    let rest = trim_leading_spaces(rest);
+    let rest = consume_eol(rest)?;
+    let rest = rest.strip_prefix(b"%%EOF")?;
+    let (_, _) = space(rest).ok()?;
+    Some(offset)
 }
 
 fn trim_spaces<'a, O>(
