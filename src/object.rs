@@ -624,6 +624,7 @@ impl Dictionary {
         )))
     }
 
+    #[inline]
     pub fn has(&self, key: &[u8]) -> bool {
         self.0.contains_key(key)
     }
@@ -636,6 +637,7 @@ impl Dictionary {
     /// Non-allocating lookup for optional dictionary keys.  `get(...).ok()`
     /// builds a `DictKey(String)` on every miss, and PDF readers probe many
     /// optional keys per glyph/page.
+    #[inline]
     pub fn get_opt(&self, key: &[u8]) -> Option<&Object> {
         self.0.get(key)
     }
@@ -652,6 +654,7 @@ impl Dictionary {
             .ok_or_else(|| Error::DictKey(String::from_utf8_lossy(key).to_string()))
     }
 
+    #[inline]
     pub fn set<K, V>(&mut self, key: K, value: V)
     where
         K: Into<PdfName>,
