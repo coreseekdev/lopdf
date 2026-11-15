@@ -5,31 +5,28 @@ use crate::error;
 use crate::xref::*;
 use std::collections::HashSet;
 use std::borrow::Cow;
-use std::str::{self, FromStr};
-
-use nom::branch::alt;
-use nom::bytes::complete::{tag, take, take_while, take_while_m_n, take_while1};
-#[cfg(test)]
-use nom::character::complete::multispace1;
-use nom::character::complete::space0;
-#[cfg(test)]
-use nom::character::complete::space1;
-use nom::character::complete::one_of;
-use nom::combinator::cut;
-use nom::combinator::{map, map_res, opt, peek, verify};
-use nom::error::{ErrorKind, ParseError};
-use nom::multi::{fold_many0, fold_many1, many0, many0_count};
-use nom::sequence::{delimited, pair, preceded, separated_pair, terminated};
-use nom::{AsBytes, AsChar, IResult, Input, Parser};
+use std::str;
+use std::str::FromStr;
 
 pub(crate) mod cmap_parser;
 
-pub(crate) type ParserInput<'a> = &'a [u8];
-// Change this to something else that implements ParseError to get a
-// different error type out of nom.
-pub(crate) type NomError<'a> = nom::error::Error<ParserInput<'a>>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ErrorKind {
+    Alt, Digit, Eof, Fail, LengthValue, Many0, MapRes, OneOf, Tag, TakeWhile1, TooLarge,
+}
 
-pub(crate) type NomResult<'a, O, E = NomError<'a>> = IResult<ParserInput<'a>, O, E>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NomError<'a> { input: ParserInput<'a>, kind: ErrorKind }
+impl<'a> NomError<'a> {
+    pub(crate) fn new(input: ParserInput<'a>, kind: ErrorKind) -> Self { Self { input, kind } }
+    pub(crate) fn from_error_kind(input: ParserInput<'a>, kind: ErrorKind) -> Self { Self::new(input, kind) }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ParseErr<E> { Error(E), Failure(E), Incomplete }
+
+pub(crate) type ParserInput<'a> = &'a [u8];
+pub(crate) type NomResult<'a, O> = Result<(ParserInput<'a>, O), ParseErr<NomError<'a>>>;
 
 #[inline]
 fn strip_nom<O>(r: NomResult<O>) -> Option<O> {
@@ -44,8 +41,7 @@ fn convert_result<O, E>(
 ) -> NomResult<O> {
     result.map(|o| (input, o)).map_err(|_| {
         // this is a unit bind if NomError = ()
-        let err: NomError = nom::error::Error::from_error_kind(input, error_kind);
-        nom::Err::Error(err)
+        ParseErr::Error(NomError::from_error_kind(input, error_kind))
     })
 }
 
@@ -57,19 +53,24 @@ fn offset_stream(object: &mut Object, offset: usize) {
 }
 
 pub(crate) fn eol(input: ParserInput) -> NomResult<ParserInput> {
-    alt((tag(&b"\r\n"[..]), tag(&b"\n"[..]), tag(&b"\r"[..]))).parse(input)
+    let rest = input
+        .strip_prefix(b"\r\n")
+        .or_else(|| input.strip_prefix(b"\n"))
+        .or_else(|| input.strip_prefix(b"\r"))
+        .ok_or_else(|| ParseErr::Error(NomError::from_error_kind(input, ErrorKind::Tag)))?;
+    Ok((rest, &input[..input.len() - rest.len()]))
 }
 
 pub(crate) fn comment(input: ParserInput) -> NomResult<()> {
-    map(
-        (
-            tag(&b"%"[..]),
-            take_while(|c: u8| !b"\r\n".contains(&c)),
-            eol,
-        ),
-        |_| (),
-    )
-    .parse(input)
+    let rest = input
+        .strip_prefix(b"%")
+        .ok_or_else(|| ParseErr::Error(NomError::from_error_kind(input, ErrorKind::Tag)))?;
+    let end = rest
+        .iter()
+        .position(|byte| matches!(*byte, b'\r' | b'\n'))
+        .unwrap_or(rest.len());
+    let (rest, _) = eol(&rest[end..])?;
+    Ok((rest, ()))
 }
 
 #[inline]
@@ -174,7 +175,7 @@ fn integer(input: ParserInput) -> NomResult<i64> {
         index += 1;
     }
     if index == digits_start {
-        return Err(nom::Err::Error(NomError::from_error_kind(
+        return Err(ParseErr::Error(NomError::from_error_kind(
             input,
             ErrorKind::Digit,
         )));
@@ -208,7 +209,7 @@ fn integer(input: ParserInput) -> NomResult<i64> {
 
 #[inline]
 fn real(input: ParserInput) -> NomResult<f32> {
-    let bytes = input.as_bytes();
+    let bytes = input;
     let mut offset = 0usize;
     let negative = match bytes.first() {
         Some(b'-') => {
@@ -255,7 +256,7 @@ fn real(input: ParserInput) -> NomResult<f32> {
         }
     }
     if digits == 0 || !saw_dot {
-        return Err(nom::Err::Error(NomError::from_error_kind(
+        return Err(ParseErr::Error(NomError::from_error_kind(
             input,
             ErrorKind::Digit,
         )));
@@ -271,7 +272,7 @@ fn real(input: ParserInput) -> NomResult<f32> {
         }
         cleaned.extend(bytes[..offset].iter().copied().filter(|&byte| byte != b'-'));
         let value = f32::from_str(str::from_utf8(&cleaned).unwrap())
-            .map_err(|_| nom::Err::Error(NomError::from_error_kind(input, ErrorKind::Digit)))?;
+            .map_err(|_| ParseErr::Error(NomError::from_error_kind(input, ErrorKind::Digit)))?;
         return Ok((rest, value));
     }
     let scale = 10u64.pow(fraction_digits) as f64;
@@ -290,19 +291,20 @@ fn hex_value(byte: u8) -> Option<u8> {
 }
 
 pub(crate) fn hex_char(input: ParserInput) -> NomResult<u8> {
-    map_res(
-        verify(take(2usize), |h: ParserInput| {
-            h.as_bytes().iter().copied().all(AsChar::is_hex_digit)
-        }),
-        |x: ParserInput| u8::from_str_radix(str::from_utf8(x).unwrap(), 16),
-    )
-    .parse(input)
+    let bytes = input
+        .get(..2)
+        .ok_or_else(|| ParseErr::Error(NomError::from_error_kind(input, ErrorKind::Digit)))?;
+    let high = hex_value(bytes[0])
+        .ok_or_else(|| ParseErr::Error(NomError::from_error_kind(input, ErrorKind::Digit)))?;
+    let low = hex_value(bytes[1])
+        .ok_or_else(|| ParseErr::Error(NomError::from_error_kind(input, ErrorKind::Digit)))?;
+    Ok((&input[2..], high << 4 | low))
 }
 
 #[inline]
 pub(crate) fn name(input: ParserInput) -> NomResult<Vec<u8>> {
     let Some(rest) = input.strip_prefix(b"/") else {
-        return Err(nom::Err::Error(NomError::from_error_kind(
+        return Err(ParseErr::Error(NomError::from_error_kind(
             input,
             ErrorKind::Tag,
         )));
@@ -434,7 +436,7 @@ fn literal_body(
 
 fn literal_string_pdf(input: ParserInput) -> NomResult<PdfString> {
     let Some(rest) = input.strip_prefix(b"(") else {
-        return Err(nom::Err::Error(NomError::from_error_kind(
+        return Err(ParseErr::Error(NomError::from_error_kind(
             input,
             ErrorKind::Tag,
         )));
@@ -453,7 +455,7 @@ fn literal_string_pdf(input: ParserInput) -> NomResult<PdfString> {
 
 fn literal_string(input: ParserInput) -> NomResult<Vec<u8>> {
     let Some(rest) = input.strip_prefix(b"(") else {
-        return Err(nom::Err::Error(NomError::from_error_kind(
+        return Err(ParseErr::Error(NomError::from_error_kind(
             input,
             ErrorKind::Tag,
         )));
@@ -461,7 +463,7 @@ fn literal_string(input: ParserInput) -> NomResult<Vec<u8>> {
     let mut out = Vec::with_capacity(16);
     match literal_body(rest, crate::reader::MAX_BRACKET, &mut out) {
         Ok(consumed) => Ok((&rest[consumed..], out)),
-        Err(offset) => Err(nom::Err::Error(NomError::from_error_kind(
+        Err(offset) => Err(ParseErr::Error(NomError::from_error_kind(
             &rest[offset..],
             ErrorKind::Tag,
         ))),
@@ -470,7 +472,7 @@ fn literal_string(input: ParserInput) -> NomResult<Vec<u8>> {
 
 fn hexadecimal_string(input: ParserInput) -> NomResult<Object> {
     let Some(rest) = input.strip_prefix(b"<") else {
-        return Err(nom::Err::Error(NomError::from_error_kind(
+        return Err(ParseErr::Error(NomError::from_error_kind(
             input,
             ErrorKind::Tag,
         )));
@@ -502,7 +504,7 @@ fn hexadecimal_string(input: ParserInput) -> NomResult<Object> {
         }
         index += 1;
     }
-    Err(nom::Err::Error(NomError::from_error_kind(
+    Err(ParseErr::Error(NomError::from_error_kind(
         &rest[index..],
         ErrorKind::Tag,
     )))
@@ -510,78 +512,34 @@ fn hexadecimal_string(input: ParserInput) -> NomResult<Object> {
 
 #[inline]
 fn boolean(input: ParserInput) -> NomResult<Object> {
-    alt((
-        map(tag(&b"true"[..]), |_| Object::Boolean(true)),
-        map(tag(&b"false"[..]), |_| Object::Boolean(false)),
-    ))
-    .parse(input)
+    if let Some(rest) = input.strip_prefix(b"true") {
+        Ok((rest, Object::Boolean(true)))
+    } else if let Some(rest) = input.strip_prefix(b"false") {
+        Ok((rest, Object::Boolean(false)))
+    } else {
+        Err(ParseErr::Error(NomError::from_error_kind(input, ErrorKind::Tag)))
+    }
 }
 
 #[inline]
 fn null(input: ParserInput) -> NomResult<Object> {
-    map(tag(&b"null"[..]), |_| Object::Null).parse(input)
+    input
+        .strip_prefix(b"null")
+        .map(|rest| (rest, Object::Null))
+        .ok_or_else(|| ParseErr::Error(NomError::from_error_kind(input, ErrorKind::Tag)))
 }
 
 fn array(depth: usize) -> impl Fn(ParserInput) -> NomResult<Vec<Object>> {
-    move |input| {
-        delimited(
-            pair(tag(&b"["[..]), space),
-            many0(_direct_object(depth)),
-            array_end,
-        )
-        .parse(input)
-    }
-}
-
-/// An array normally closes with `]`.  A damaged file may omit it and close
-/// the enclosing dictionary instead (`/Kids[8 0 R>>`); pdfium's loose array
-/// parser stops at an object-ending token without consuming it
-/// (cpdf_syntax_parser.cpp, GetObjectBodyInternal: `>>` restores the saved
-/// position and ends the array), so the dictionary that follows still closes.
-/// `endobj` is accepted for the same reason as in [`dictionary_end`].
-fn array_end(input: ParserInput) -> NomResult<()> {
-    alt((
-        map(tag(&b"]"[..]), |_| ()),
-        map(
-            peek(preceded(
-                space0,
-                alt((tag(&b">>"[..]), tag(&b"endobj"[..]))),
-            )),
-            |_| (),
-        ),
-    ))
-    .parse(input)
+    move |input| direct_array(input, depth)
 }
 
 pub(crate) fn dictionary(input: ParserInput) -> NomResult<Dictionary> {
-    _dictionary(crate::reader::MAX_NESTING_DEPTH)(input)
-}
-
-fn _dictionary(depth: usize) -> impl Fn(ParserInput) -> NomResult<Dictionary> {
-    move |input| {
-        delimited(
-            pair(tag(&b"<<"[..]), space),
-            inner_dictionary(depth),
-            dictionary_end,
-        )
-        .parse(input)
-    }
-}
-
-/// A dictionary normally closes with `>>`.  Some damaged files omit it and
-/// jump straight to `endobj`; accept that boundary so the font or resource
-/// dictionary still resolves instead of turning the whole object into null.
-fn dictionary_end(input: ParserInput) -> NomResult<()> {
-    alt((
-        map(tag(&b">>"[..]), |_| ()),
-        map(peek(preceded(space0, tag(&b"endobj"[..]))), |_| ()),
-    ))
-    .parse(input)
+    direct_dictionary(input, crate::reader::MAX_NESTING_DEPTH)
 }
 
 fn name_pdf(input: ParserInput) -> NomResult<'_, PdfName> {
     let Some(rest) = input.strip_prefix(b"/") else {
-        return Err(nom::Err::Error(NomError::from_error_kind(
+        return Err(ParseErr::Error(NomError::from_error_kind(
             input,
             ErrorKind::Tag,
         )));
@@ -599,7 +557,7 @@ fn name_pdf(input: ParserInput) -> NomResult<'_, PdfName> {
 
 fn dictionary_key(input: ParserInput) -> NomResult<'_, PdfName> {
     let Some(rest) = input.strip_prefix(b"/") else {
-        return Err(nom::Err::Error(NomError::from_error_kind(
+        return Err(ParseErr::Error(NomError::from_error_kind(
             input,
             ErrorKind::Tag,
         )));
@@ -633,9 +591,9 @@ fn inner_dictionary(depth: usize) -> impl Fn(ParserInput) -> NomResult<Dictionar
             }
             let (next, key) = dictionary_key(rest)?;
             let (next, _) = space(next)?;
-            let (next, value) = _direct_object(depth).parse(next)?;
+            let (next, value) = _direct_object(depth)(next)?;
             if next.len() == rest.len() {
-                return Err(nom::Err::Error(NomError::from_error_kind(
+                return Err(ParseErr::Error(NomError::from_error_kind(
                     rest,
                     ErrorKind::Many0,
                 )));
@@ -644,38 +602,6 @@ fn inner_dictionary(depth: usize) -> impl Fn(ParserInput) -> NomResult<Dictionar
             rest = next;
         }
     }
-}
-
-#[cfg(test)]
-pub(crate) fn dict_dup(input: ParserInput) -> NomResult<Dictionary> {
-    delimited(
-        (
-            digit1,
-            space1,
-            tag(&b"dict"[..]),
-            space1,
-            tag(&b"dup"[..]),
-            space1,
-            tag(&b"begin"[..]),
-            multispace1,
-        ),
-        fold_many0(
-            terminated(
-                pair(
-                    terminated(name, space),
-                    _direct_object(crate::reader::MAX_NESTING_DEPTH),
-                ),
-                pair(tag(&b"def"[..]), multispace1),
-            ),
-            || Dictionary::with_capacity(4),
-            |mut dict, (key, value)| {
-                dict.set(key, value);
-                dict
-            },
-        ),
-        tag(&b"end"[..]),
-    )
-    .parse(input)
 }
 
 /// Recover the payload end from the first unambiguous terminator.
@@ -760,14 +686,14 @@ fn stream<'a>(
     let (rest, dict) = direct_dictionary(input, crate::reader::MAX_NESTING_DEPTH)?;
     let rest = space(rest)?.0;
     let Some(rest) = rest.strip_prefix(b"stream") else {
-        return Err(nom::Err::Error(NomError::from_error_kind(
+        return Err(ParseErr::Error(NomError::from_error_kind(
             rest,
             ErrorKind::Tag,
         )));
     };
     let rest = skip_stream_space(rest);
     let Some(i) = consume_eol(rest) else {
-        return Err(nom::Err::Error(NomError::from_error_kind(
+        return Err(ParseErr::Error(NomError::from_error_kind(
             rest,
             ErrorKind::Tag,
         )));
@@ -821,7 +747,7 @@ fn stream<'a>(
             Object::Stream(Stream::with_position(dict, input.len() - i.len())),
         ))
     } else {
-        Err(nom::Err::Failure(NomError::from_error_kind(
+        Err(ParseErr::Failure(NomError::from_error_kind(
             i,
             ErrorKind::LengthValue,
         )))
@@ -878,14 +804,14 @@ fn unsigned_int<I: UnsignedToken>(input: ParserInput) -> NomResult<I> {
         index += 1;
     }
     if index == 0 || overflow {
-        return Err(nom::Err::Error(NomError::from_error_kind(
+        return Err(ParseErr::Error(NomError::from_error_kind(
             input,
             ErrorKind::MapRes,
         )));
     }
     match I::from_u64(value) {
         Some(value) => Ok((&bytes[index..], value)),
-        None => Err(nom::Err::Error(NomError::from_error_kind(
+        None => Err(ParseErr::Error(NomError::from_error_kind(
             input,
             ErrorKind::MapRes,
         ))),
@@ -901,7 +827,11 @@ fn object_id(input: ParserInput) -> NomResult<ObjectId> {
 }
 
 fn reference(input: ParserInput) -> NomResult<Object> {
-    map(terminated(object_id, tag(&b"R"[..])), Object::Reference).parse(input)
+    let (rest, id) = object_id(input)?;
+    let Some(rest) = rest.strip_prefix(b"R") else {
+        return Err(ParseErr::Error(NomError::from_error_kind(rest, ErrorKind::Tag)));
+    };
+    Ok((rest, Object::Reference(id)))
 }
 
 #[inline]
@@ -949,7 +879,7 @@ fn direct_reference(input: ParserInput) -> NomResult<Object> {
     let (rest, generation) = unsigned_int::<u16>(rest)?;
     let (rest, _) = space(rest)?;
     let Some(rest) = rest.strip_prefix(b"R") else {
-        return Err(nom::Err::Error(NomError::from_error_kind(
+        return Err(ParseErr::Error(NomError::from_error_kind(
             rest,
             ErrorKind::Tag,
         )));
@@ -959,7 +889,7 @@ fn direct_reference(input: ParserInput) -> NomResult<Object> {
 
 fn direct_array(input: ParserInput, depth: usize) -> NomResult<Vec<Object>> {
     let Some(rest) = input.strip_prefix(b"[") else {
-        return Err(nom::Err::Error(NomError::from_error_kind(
+        return Err(ParseErr::Error(NomError::from_error_kind(
             input,
             ErrorKind::Tag,
         )));
@@ -981,7 +911,7 @@ fn direct_array(input: ParserInput, depth: usize) -> NomResult<Vec<Object>> {
 
 fn direct_dictionary(input: ParserInput, depth: usize) -> NomResult<Dictionary> {
     let Some(rest) = input.strip_prefix(b"<<") else {
-        return Err(nom::Err::Error(NomError::from_error_kind(
+        return Err(ParseErr::Error(NomError::from_error_kind(
             input,
             ErrorKind::Tag,
         )));
@@ -1005,25 +935,32 @@ fn direct_dictionary(input: ParserInput, depth: usize) -> NomResult<Dictionary> 
 
 fn direct_value(input: ParserInput, depth: usize) -> NomResult<Object> {
     if depth == 0 {
-        return Err(nom::Err::Failure(NomError::from_error_kind(
+        return Err(ParseErr::Failure(NomError::from_error_kind(
             input,
             ErrorKind::TooLarge,
         )));
     }
     match input.first() {
-        Some(b'/') => map(name_pdf, Object::Name).parse(input),
-        Some(b'(') => map(literal_string_pdf, |string| {
-            Object::String(string, StringFormat::Literal)
-        })
-        .parse(input),
+        Some(b'/') => {
+            let (rest, name) = name_pdf(input)?;
+            Ok((rest, Object::Name(name)))
+        }
+        Some(b'(') => {
+            let (rest, string) = literal_string_pdf(input)?;
+            Ok((rest, Object::String(string, StringFormat::Literal)))
+        }
         Some(b'<') => {
             if input.get(1) == Some(&b'<') {
-                map(|i| direct_dictionary(i, depth), Object::Dictionary).parse(input)
+                let (rest, dictionary) = direct_dictionary(input, depth)?;
+                Ok((rest, Object::Dictionary(dictionary)))
             } else {
                 hexadecimal_string(input)
             }
         }
-        Some(b'[') => map(|i| direct_array(i, depth), Object::Array).parse(input),
+        Some(b'[') => {
+            let (rest, array) = direct_array(input, depth)?;
+            Ok((rest, Object::Array(array)))
+        }
         Some(b't') if input.starts_with(b"true") => Ok((&input[4..], Object::Boolean(true))),
         Some(b'f') if input.starts_with(b"false") => Ok((&input[5..], Object::Boolean(false))),
         Some(b'n') if input.starts_with(b"null") => Ok((&input[4..], Object::Null)),
@@ -1035,7 +972,7 @@ fn direct_value(input: ParserInput, depth: usize) -> NomResult<Object> {
             }
         }
         Some(b'+' | b'-' | b'.') => number(input),
-        _ => Err(nom::Err::Error(NomError::from_error_kind(
+        _ => Err(ParseErr::Error(NomError::from_error_kind(
             input,
             ErrorKind::Alt,
         ))),
@@ -1049,7 +986,7 @@ fn _direct_objects(depth: usize) -> impl Fn(ParserInput) -> NomResult<Object> {
 fn _direct_object(depth: usize) -> impl Fn(ParserInput) -> NomResult<Object> {
     move |input| {
         if depth == 0 {
-            return Err(nom::Err::Failure(NomError::from_error_kind(
+            return Err(ParseErr::Failure(NomError::from_error_kind(
                 input,
                 ErrorKind::TooLarge,
             )));
@@ -1079,7 +1016,7 @@ fn object<'a>(
         recovery_bound,
     ) {
         Ok(result) => Ok(result),
-        Err(nom::Err::Failure(error)) => Err(nom::Err::Failure(error)),
+        Err(ParseErr::Failure(error)) => Err(ParseErr::Failure(error)),
         Err(_) => {
             let (rest, value) = direct_value(input, crate::reader::MAX_NESTING_DEPTH)?;
             let (rest, _) = space(rest)?;
@@ -1100,7 +1037,7 @@ pub fn indirect_object(
     // end offset as the maximum length a suffix may have.
     let recovery_bound = recovery_bound.map(|end| input.len().saturating_sub(end));
     let (id, mut object) = _indirect_object(
-        input.take_from(offset),
+        &input[offset..],
         offset,
         expected_id,
         reader,
@@ -1138,20 +1075,17 @@ fn _indirect_object<'a>(
     }
 
     let object_offset = input.len() - i.len();
-    let (_, mut object) = terminated(
-        |i: ParserInput<'a>| {
-            object(
-                i,
-                reader,
-                already_seen,
-                recover_stream_length,
-                recovery_bound,
-            )
-        },
-        (space, opt(tag(&b"endobj"[..])), space),
+    let (rest, mut object) = object(
+        i,
+        reader,
+        already_seen,
+        recover_stream_length,
+        recovery_bound,
     )
-    .parse(i)
     .map_err(|_| Error::IndirectObject { offset })?;
+    let (rest, _) = space(rest).map_err(|_| Error::IndirectObject { offset })?;
+    let rest = rest.strip_prefix(b"endobj").unwrap_or(rest);
+    let _ = space(rest).map_err(|_| Error::IndirectObject { offset })?;
 
     offset_stream(&mut object, object_offset);
 
@@ -1207,7 +1141,7 @@ pub fn binary_mark(input: ParserInput) -> Option<Vec<u8>> {
 fn xref(input: ParserInput, strict: bool) -> NomResult<Xref> {
     let mut rest = input
         .strip_prefix(b"xref")
-        .ok_or_else(|| nom::Err::Error(NomError::from_error_kind(input, ErrorKind::Tag)))?;
+        .ok_or_else(|| ParseErr::Error(NomError::from_error_kind(input, ErrorKind::Tag)))?;
     if rest.starts_with(b" ") {
         rest = &rest[1..];
     }
@@ -1220,7 +1154,7 @@ fn xref(input: ParserInput, strict: bool) -> NomResult<Xref> {
         }
         let (next, start) = unsigned_int::<usize>(rest)?;
         let Some(next) = next.strip_prefix(b" ") else {
-            return Err(nom::Err::Error(NomError::from_error_kind(
+            return Err(ParseErr::Error(NomError::from_error_kind(
                 next,
                 ErrorKind::Tag,
             )));
@@ -1234,7 +1168,7 @@ fn xref(input: ParserInput, strict: bool) -> NomResult<Xref> {
                     rest = next;
                     entry
                 }
-                Err(nom::Err::Error(_)) => break,
+                Err(ParseErr::Error(_)) => break,
                 Err(error) => return Err(error),
             };
             let ((offset, generation), is_normal) = entry;
@@ -1257,7 +1191,7 @@ fn xref(input: ParserInput, strict: bool) -> NomResult<Xref> {
     }
 }
 
-fn xref_eol(input: ParserInput, strict: bool) -> Result<ParserInput, nom::Err<NomError<'_>>> {
+fn xref_eol(input: ParserInput, strict: bool) -> Result<ParserInput, ParseErr<NomError<'_>>> {
     if let Some(rest) = input
         .strip_prefix(b" \r")
         .or_else(|| input.strip_prefix(b" \n"))
@@ -1273,7 +1207,7 @@ fn xref_eol(input: ParserInput, strict: bool) -> Result<ParserInput, nom::Err<No
             return Ok(rest);
         }
     }
-    Err(nom::Err::Error(NomError::from_error_kind(
+    Err(ParseErr::Error(NomError::from_error_kind(
         input,
         ErrorKind::Tag,
     )))
@@ -1282,17 +1216,17 @@ fn xref_eol(input: ParserInput, strict: bool) -> Result<ParserInput, nom::Err<No
 fn xref_entry(
     input: ParserInput,
     strict: bool,
-) -> Result<(ParserInput, ((u32, u32), bool)), nom::Err<NomError<'_>>> {
+) -> Result<(ParserInput, ((u32, u32), bool)), ParseErr<NomError<'_>>> {
     let (rest, offset) = unsigned_int::<u32>(input)?;
     let Some(rest) = rest.strip_prefix(b" ") else {
-        return Err(nom::Err::Error(NomError::from_error_kind(
+        return Err(ParseErr::Error(NomError::from_error_kind(
             rest,
             ErrorKind::Tag,
         )));
     };
     let (rest, generation) = unsigned_int::<u32>(rest)?;
     let Some(rest) = rest.strip_prefix(b" ") else {
-        return Err(nom::Err::Error(NomError::from_error_kind(
+        return Err(ParseErr::Error(NomError::from_error_kind(
             rest,
             ErrorKind::Tag,
         )));
@@ -1301,7 +1235,7 @@ fn xref_entry(
         Some(b'n') => (&rest[1..], true),
         Some(b'f') => (&rest[1..], false),
         _ => {
-            return Err(nom::Err::Error(NomError::from_error_kind(
+            return Err(ParseErr::Error(NomError::from_error_kind(
                 rest,
                 ErrorKind::OneOf,
             )))
@@ -1314,7 +1248,7 @@ fn xref_entry(
 fn trailer(input: ParserInput) -> NomResult<Dictionary> {
     let rest = input
         .strip_prefix(b"trailer")
-        .ok_or_else(|| nom::Err::Error(NomError::from_error_kind(input, ErrorKind::Tag)))?;
+        .ok_or_else(|| ParseErr::Error(NomError::from_error_kind(input, ErrorKind::Tag)))?;
     let (rest, _) = space(rest)?;
     let (rest, dictionary) = direct_dictionary(rest, crate::reader::MAX_NESTING_DEPTH)?;
     let (rest, _) = space(rest)?;
@@ -1364,26 +1298,24 @@ pub fn xref_start(input: ParserInput) -> Option<i64> {
     Some(offset)
 }
 
-fn trim_spaces<'a, O>(
-    p: impl Parser<ParserInput<'a>, Output = O, Error = NomError<'a>>,
-) -> impl Parser<ParserInput<'a>, Output = O, Error = NomError<'a>> {
-    delimited(many0(tag(" ")), p, many0(tag(" ")))
-}
 
 // The following code create parser to parse content stream.
 
 fn content_space(input: ParserInput) -> NomResult<()> {
-    map(take_while(is_whitespace), |_| ()).parse(input)
+    let rest = skip_content_space(input);
+    Ok((rest, ()))
 }
 
 fn operator(input: ParserInput) -> NomResult<Cow<'static, str>> {
-    let (rest, op) = verify(
-        take_while1(|c: u8| c.is_ascii_alphanumeric() || b"*'\"".contains(&c)),
-        |op: ParserInput| !op[0].is_ascii_digit(),
-    )
-    .parse(input)?;
-    let text = str::from_utf8(op).unwrap();
-    Ok((rest, intern_operator(text)))
+    let count = input
+        .iter()
+        .take_while(|byte| byte.is_ascii_alphanumeric() || b"*'\"".contains(byte))
+        .count();
+    if count == 0 || input[0].is_ascii_digit() {
+        return Err(ParseErr::Error(NomError::from_error_kind(input, ErrorKind::TakeWhile1)));
+    }
+    let text = str::from_utf8(&input[..count]).unwrap();
+    Ok((&input[count..], intern_operator(text)))
 }
 
 /// Standard PDF operators borrow a static string; unknown operators keep
@@ -1504,7 +1436,7 @@ fn number(input: ParserInput) -> NomResult<Object> {
         index += 1;
     }
     if bytes.get(index) == Some(&b'.') {
-        return map(real, Object::Real).parse(input);
+        return real(input).map(|(rest, value)| (rest, Object::Real(value)));
     }
     if index > digits_start && !overflow {
         let signed = if negative {
@@ -1514,26 +1446,36 @@ fn number(input: ParserInput) -> NomResult<Object> {
         };
         return Ok((&bytes[index..], Object::Integer(signed)));
     }
-    map(integer, Object::Integer).parse(input)
+    integer(input).map(|(rest, value)| (rest, Object::Integer(value)))
 }
 
 #[inline]
 fn operand_value(input: ParserInput) -> NomResult<Object> {
     match input.first() {
-        Some(b'/') => map(name_pdf, Object::Name).parse(input),
-        Some(b'(') => map(literal_string_pdf, |s| Object::String(s, StringFormat::Literal)).parse(input),
+        Some(b'/') => {
+            let (rest, name) = name_pdf(input)?;
+            Ok((rest, Object::Name(name)))
+        }
+        Some(b'(') => {
+            let (rest, string) = literal_string_pdf(input)?;
+            Ok((rest, Object::String(string, StringFormat::Literal)))
+        }
         Some(b'<') => {
             if input.get(1) == Some(&b'<') {
-                map(dictionary, Object::Dictionary).parse(input)
+                let (rest, dict) = dictionary(input)?;
+                Ok((rest, Object::Dictionary(dict)))
             } else {
                 hexadecimal_string(input)
             }
         }
-        Some(b'[') => map(array(crate::reader::MAX_NESTING_DEPTH), Object::Array).parse(input),
+        Some(b'[') => {
+            let (rest, array) = array(crate::reader::MAX_NESTING_DEPTH)(input)?;
+            Ok((rest, Object::Array(array)))
+        }
         Some(b't' | b'f') => boolean(input),
         Some(b'n') => null(input),
         Some(b'0'..=b'9' | b'+' | b'-' | b'.') => number(input),
-        _ => Err(nom::Err::Error(NomError::from_error_kind(
+        _ => Err(ParseErr::Error(NomError::from_error_kind(
             input,
             ErrorKind::Alt,
         ))),
@@ -1582,19 +1524,26 @@ fn skip_token_space(input: ParserInput) -> ParserInput {
 
 fn token_value(input: ParserInput, depth: usize) -> NomResult<Object> {
     match input.first() {
-        Some(b'/') => map(name_pdf, Object::Name).parse(input),
-        Some(b'(') => map(literal_string_pdf, |string| {
-            Object::String(string, StringFormat::Literal)
-        })
-        .parse(input),
+        Some(b'/') => {
+            let (rest, name) = name_pdf(input)?;
+            Ok((rest, Object::Name(name)))
+        }
+        Some(b'(') => {
+            let (rest, string) = literal_string_pdf(input)?;
+            Ok((rest, Object::String(string, StringFormat::Literal)))
+        }
         Some(b'<') => {
             if input.get(1) == Some(&b'<') {
-                map(|i| token_dictionary(i, depth), Object::Dictionary).parse(input)
+                let (rest, dict) = token_dictionary(input, depth)?;
+                Ok((rest, Object::Dictionary(dict)))
             } else {
                 hexadecimal_string(input)
             }
         }
-        Some(b'[') => map(|i| token_array(i, depth), Object::Array).parse(input),
+        Some(b'[') => {
+            let (rest, array) = token_array(input, depth)?;
+            Ok((rest, Object::Array(array)))
+        }
         Some(b't') if input.starts_with(b"true") => {
             Ok((&input[4..], Object::Boolean(true)))
         }
@@ -1603,7 +1552,7 @@ fn token_value(input: ParserInput, depth: usize) -> NomResult<Object> {
         }
         Some(b'n') if input.starts_with(b"null") => Ok((&input[4..], Object::Null)),
         Some(b'0'..=b'9' | b'+' | b'-' | b'.') => number(input),
-        _ => Err(nom::Err::Error(NomError::from_error_kind(
+        _ => Err(ParseErr::Error(NomError::from_error_kind(
             input,
             ErrorKind::Alt,
         ))),
@@ -1612,13 +1561,13 @@ fn token_value(input: ParserInput, depth: usize) -> NomResult<Object> {
 
 fn token_array(input: ParserInput, depth: usize) -> NomResult<Vec<Object>> {
     if depth == 0 {
-        return Err(nom::Err::Failure(NomError::from_error_kind(
+        return Err(ParseErr::Failure(NomError::from_error_kind(
             input,
             ErrorKind::TooLarge,
         )));
     }
     let Some(rest) = input.strip_prefix(b"[") else {
-        return Err(nom::Err::Error(NomError::from_error_kind(
+        return Err(ParseErr::Error(NomError::from_error_kind(
             input,
             ErrorKind::Tag,
         )));
@@ -1630,7 +1579,7 @@ fn token_array(input: ParserInput, depth: usize) -> NomResult<Vec<Object>> {
             return Ok((&rest[1..], items));
         }
         if rest.is_empty() {
-            return Err(nom::Err::Error(NomError::from_error_kind(
+            return Err(ParseErr::Error(NomError::from_error_kind(
                 rest,
                 ErrorKind::Tag,
             )));
@@ -1643,13 +1592,13 @@ fn token_array(input: ParserInput, depth: usize) -> NomResult<Vec<Object>> {
 
 fn token_dictionary(input: ParserInput, depth: usize) -> NomResult<Dictionary> {
     if depth == 0 {
-        return Err(nom::Err::Failure(NomError::from_error_kind(
+        return Err(ParseErr::Failure(NomError::from_error_kind(
             input,
             ErrorKind::TooLarge,
         )));
     }
     let Some(rest) = input.strip_prefix(b"<<") else {
-        return Err(nom::Err::Error(NomError::from_error_kind(
+        return Err(ParseErr::Error(NomError::from_error_kind(
             input,
             ErrorKind::Tag,
         )));
@@ -1676,7 +1625,7 @@ fn token_operator(input: ParserInput) -> NomResult<Cow<'static, str>> {
         })
         .count();
     if count == 0 {
-        return Err(nom::Err::Error(NomError::from_error_kind(
+        return Err(ParseErr::Error(NomError::from_error_kind(
             input,
             ErrorKind::TakeWhile1,
         )));
@@ -1755,9 +1704,9 @@ fn operation_into_nom<'a>(
     // that follows it (e.g. an indented next line).  Comments are rare; a
     // first-byte check keeps the nom fold off the common path.
     while rest.first() == Some(&b'%') {
-        match terminated(comment, content_space).parse(rest) {
-            Ok((next, ())) => rest = next,
-            Err(nom::Err::Error(_)) => break,
+        match comment(rest) {
+            Ok((next, ())) => rest = skip_content_space(next),
+            Err(ParseErr::Error(_)) => break,
             Err(error) => return Err(error),
         }
     }
@@ -1767,7 +1716,7 @@ fn operation_into_nom<'a>(
             out.append(&mut operands);
             return Ok((rest, operator));
         }
-        Err(nom::Err::Error(_)) => {}
+        Err(ParseErr::Error(_)) => {}
         Err(error) => return Err(error),
     }
     out.clear();
@@ -1792,7 +1741,7 @@ fn operation_into_nom<'a>(
             _ => match operand(rest) {
                 Ok((next, value)) => {
                     if next.len() == len {
-                        return Err(nom::Err::Error(NomError::from_error_kind(
+                        return Err(ParseErr::Error(NomError::from_error_kind(
                             rest,
                             ErrorKind::Many0,
                         )));
@@ -1800,7 +1749,7 @@ fn operation_into_nom<'a>(
                     out.push(value);
                     rest = next;
                 }
-                Err(nom::Err::Error(_)) => break,
+                Err(ParseErr::Error(_)) => break,
                 Err(error) => return Err(error),
             },
         }
@@ -1813,10 +1762,10 @@ fn operation_into_nom<'a>(
 fn inline_image(input: ParserInput) -> NomResult<(Vec<Object>, Cow<'static, str>)> {
     let rest = input
         .strip_prefix(b"BI")
-        .ok_or_else(|| nom::Err::Error(NomError::from_error_kind(input, ErrorKind::Tag)))?;
+        .ok_or_else(|| ParseErr::Error(NomError::from_error_kind(input, ErrorKind::Tag)))?;
     let rest = skip_content_space(rest);
     if rest.is_empty() {
-        return Err(nom::Err::Failure(NomError::from_error_kind(
+        return Err(ParseErr::Failure(NomError::from_error_kind(
             rest,
             ErrorKind::Eof,
         )));
@@ -1841,14 +1790,14 @@ fn inline_image_impl(input: ParserInput) -> NomResult<(Vec<Object>, Cow<'static,
     let (input, stream_dict) = inner_dictionary(crate::reader::MAX_NESTING_DEPTH)(input)?;
     let input = input
         .strip_prefix(b"ID")
-        .ok_or_else(|| nom::Err::Error(NomError::from_error_kind(input, ErrorKind::Tag)))?;
+        .ok_or_else(|| ParseErr::Error(NomError::from_error_kind(input, ErrorKind::Tag)))?;
     let (input, _) = inline_image_data_separator(input)?;
     match image_data_stream(input, stream_dict) {
         Ok((input, stream)) => {
             let input = skip_content_space(input);
             let input = input
                 .strip_prefix(b"EI")
-                .ok_or_else(|| nom::Err::Failure(NomError::from_error_kind(input, ErrorKind::Tag)))?;
+                .ok_or_else(|| ParseErr::Failure(NomError::from_error_kind(input, ErrorKind::Tag)))?;
             let input = skip_content_space(input);
             Ok((input, (vec![Object::Stream(stream)], Cow::Borrowed("BI"))))
         }
@@ -1866,8 +1815,7 @@ fn inline_image_impl(input: ParserInput) -> NomResult<(Vec<Object>, Cow<'static,
                         && (w[3] == b' ' || w[3] == b'\n' || w[3] == b'\r')
                 })
                 .ok_or_else(|| {
-                    let err: NomError = nom::error::Error::from_error_kind(input, ErrorKind::Fail);
-                    nom::Err::Failure(err)
+                    ParseErr::Failure(NomError::from_error_kind(input, ErrorKind::Fail))
                 })?;
             let input = &input[ei_pos + 3..];
             let input = skip_content_space(input);
@@ -2037,7 +1985,7 @@ fn expand_inline_colorspace(colorspace: &Object) -> Object {
 }
 
 fn find_inline_image_end(input: ParserInput) -> Option<usize> {
-    let bytes = input.as_bytes();
+    let bytes = input;
     let is_space = |byte: u8| byte.is_ascii_whitespace();
     for index in 0..bytes.len().saturating_sub(1) {
         if bytes[index] == b'E'
@@ -2074,7 +2022,7 @@ fn _content(input: ParserInput) -> NomResult<Content<Vec<Operation>>> {
         match operation_into(rest, &mut operands) {
             Ok((next, operator)) => {
                 if next.len() == len {
-                    return Err(nom::Err::Error(NomError::from_error_kind(
+                    return Err(ParseErr::Error(NomError::from_error_kind(
                         rest,
                         ErrorKind::Many0,
                     )));
@@ -2085,7 +2033,7 @@ fn _content(input: ParserInput) -> NomResult<Content<Vec<Operation>>> {
                 });
                 rest = next;
             }
-            Err(nom::Err::Error(_)) => break,
+            Err(ParseErr::Error(_)) => break,
             Err(error) => return Err(error),
         }
     }
@@ -2095,7 +2043,7 @@ fn _content(input: ParserInput) -> NomResult<Content<Vec<Operation>>> {
 
 
 pub fn content(input: ParserInput) -> Option<Content<Vec<Operation>>> {
-    strip_nom(_content.parse(input))
+    strip_nom(_content(input))
 }
 
 /// The operations of a content stream, decoded one at a time with the grammar of
@@ -2153,7 +2101,7 @@ impl<'a> ContentOperations<'a> {
                 self.input = input;
                 Some(Ok(operator))
             }
-            Err(nom::Err::Error(_)) => {
+            Err(ParseErr::Error(_)) => {
                 self.finished = true;
                 None
             }
@@ -2187,7 +2135,7 @@ impl Iterator for ContentOperations<'_> {
                 self.input = input;
                 Some(Ok(Operation { operator, operands }))
             }
-            Err(nom::Err::Error(_)) => {
+            Err(ParseErr::Error(_)) => {
                 self.finished = true;
                 None
             }
