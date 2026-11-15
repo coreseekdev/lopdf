@@ -1827,22 +1827,45 @@ fn operation_into_nom<'a>(
 }
 
 fn inline_image(input: ParserInput) -> NomResult<(Vec<Object>, Cow<'static, str>)> {
-    preceded(pair(tag(&b"BI"[..]), content_space), cut(inline_image_impl)).parse(input)
+    let rest = input
+        .strip_prefix(b"BI")
+        .ok_or_else(|| nom::Err::Error(NomError::from_error_kind(input, ErrorKind::Tag)))?;
+    let rest = skip_content_space(rest);
+    if rest.is_empty() {
+        return Err(nom::Err::Failure(NomError::from_error_kind(
+            rest,
+            ErrorKind::Eof,
+        )));
+    }
+    inline_image_impl(rest)
 }
 
 /// The single white-space character between `ID` and the image data (ISO 32000-2, 8.9.7),
 /// with a CR LF pair read as one end-of-line. White space after it is image data: a gray
 /// level of 32 is a space byte.
 fn inline_image_data_separator(input: ParserInput) -> NomResult<()> {
-    map(opt(alt((eol, take_while_m_n(1, 1, is_whitespace)))), |_| ()).parse(input)
+    if let Some(rest) = consume_eol(input) {
+        return Ok((rest, ()));
+    }
+    if input.first().is_some_and(|byte| byte.is_ascii_whitespace()) {
+        return Ok((&input[1..], ()));
+    }
+    Ok((input, ()))
 }
 
 fn inline_image_impl(input: ParserInput) -> NomResult<(Vec<Object>, Cow<'static, str>)> {
-    let (input, stream_dict) = inner_dictionary(crate::reader::MAX_NESTING_DEPTH).parse(input)?;
-    let (input, _) = pair(tag(&b"ID"[..]), inline_image_data_separator).parse(input)?;
+    let (input, stream_dict) = inner_dictionary(crate::reader::MAX_NESTING_DEPTH)(input)?;
+    let input = input
+        .strip_prefix(b"ID")
+        .ok_or_else(|| nom::Err::Error(NomError::from_error_kind(input, ErrorKind::Tag)))?;
+    let (input, _) = inline_image_data_separator(input)?;
     match image_data_stream(input, stream_dict) {
         Ok((input, stream)) => {
-            let (input, _) = (content_space, tag(&b"EI"[..]), content_space).parse(input)?;
+            let input = skip_content_space(input);
+            let input = input
+                .strip_prefix(b"EI")
+                .ok_or_else(|| nom::Err::Failure(NomError::from_error_kind(input, ErrorKind::Tag)))?;
+            let input = skip_content_space(input);
             Ok((input, (vec![Object::Stream(stream)], Cow::Borrowed("BI"))))
         }
         Err(e) => {
@@ -1862,11 +1885,8 @@ fn inline_image_impl(input: ParserInput) -> NomResult<(Vec<Object>, Cow<'static,
                     let err: NomError = nom::error::Error::from_error_kind(input, ErrorKind::Fail);
                     nom::Err::Failure(err)
                 })?;
-            let (input, _) = take(ei_pos + 3).parse(input).map_err(|_: nom::Err<()>| {
-                let err: NomError = nom::error::Error::from_error_kind(input, ErrorKind::Fail);
-                nom::Err::Failure(err)
-            })?;
-            let (input, _) = content_space(input)?;
+            let input = &input[ei_pos + 3..];
+            let input = skip_content_space(input);
             Ok((input, (vec![], Cow::Borrowed("BI"))))
         }
     }
@@ -1955,9 +1975,12 @@ fn image_data_stream(
     }
 
     let (input, content) = match filter {
-        None => take(length)
-            .parse(input)
-            .map_err(|_: nom::Err<()>| crate::error::ParseError::EndOfInput)?,
+        None => {
+            if input.len() < length {
+                return Err(crate::error::ParseError::EndOfInput.into());
+            }
+            (&input[length..], &input[..length])
+        }
         Some(_) => {
             // With a filter the compressed length is unknown; the data ends
             // at the first whitespace-framed `EI` marker.
