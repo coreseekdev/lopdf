@@ -1,5 +1,69 @@
-use std::collections::BTreeMap;
+
 use std::io::{Result, Write};
+
+/// Dense object-number indexed cross-reference entries.
+#[derive(Debug, Clone, Default)]
+pub struct XrefStore {
+    entries: Vec<Option<(u32, XrefEntry)>>,
+    len: usize,
+}
+
+impl XrefStore {
+    pub fn new() -> Self { Self::default() }
+    pub fn len(&self) -> usize { self.len }
+    pub fn is_empty(&self) -> bool { self.len == 0 }
+    pub fn get(&self, id: &u32) -> Option<&XrefEntry> {
+        let entry = self.entries.get(*id as usize)?.as_ref()?;
+        (entry.0 == *id).then_some(&entry.1)
+    }
+    pub fn contains_key(&self, id: &u32) -> bool { self.get(id).is_some() }
+    pub fn insert(&mut self, id: u32, entry: XrefEntry) {
+        let index = id as usize;
+        if self.entries.len() <= index {
+            self.entries.resize_with(index + 1, || None);
+        }
+        if self.entries[index].is_none() { self.len += 1; }
+        self.entries[index] = Some((id, entry));
+    }
+    pub fn remove(&mut self, id: &u32) -> Option<XrefEntry> {
+        let slot = self.entries.get_mut(*id as usize)?.take()?;
+        if slot.0 != *id {
+            self.entries[*id as usize] = Some(slot);
+            return None;
+        }
+        self.len -= 1;
+        Some(slot.1)
+    }
+    pub fn clear(&mut self) { self.entries.clear(); self.len = 0; }
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = (&u32, &XrefEntry)> {
+        self.entries.iter().filter_map(|entry| entry.as_ref().map(|(id, value)| (id, value)))
+    }
+    pub fn keys(&self) -> impl DoubleEndedIterator<Item = &u32> {
+        self.entries.iter().filter_map(|entry| entry.as_ref().map(|(id, _)| id))
+    }
+    pub fn values(&self) -> impl DoubleEndedIterator<Item = &XrefEntry> {
+        self.entries.iter().filter_map(|entry| entry.as_ref().map(|(_, value)| value))
+    }
+}
+
+impl<'a> IntoIterator for &'a XrefStore {
+    type Item = (&'a u32, &'a XrefEntry);
+    type IntoIter = std::iter::FilterMap<std::slice::Iter<'a, Option<(u32, XrefEntry)>>, fn(&'a Option<(u32, XrefEntry)>) -> Option<(&'a u32, &'a XrefEntry)>>;
+    fn into_iter(self) -> Self::IntoIter {
+        fn entry<'a>(entry: &'a Option<(u32, XrefEntry)>) -> Option<(&'a u32, &'a XrefEntry)> {
+            entry.as_ref().map(|(id, value)| (id, value))
+        }
+        self.entries.iter().filter_map(entry)
+    }
+}
+
+impl IntoIterator for XrefStore {
+    type Item = (u32, XrefEntry);
+    type IntoIter = std::iter::Flatten<std::vec::IntoIter<Option<(u32, XrefEntry)>>>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.into_iter().flatten()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Xref {
@@ -9,7 +73,7 @@ pub struct Xref {
     pub cross_reference_type: XrefType,
 
     /// Entries for indirect object.
-    pub entries: BTreeMap<u32, XrefEntry>,
+    pub entries: XrefStore,
 
     /// Total number of entries (including free entries), equal to the highest object number plus 1.
     pub size: u32,
@@ -41,7 +105,7 @@ impl Xref {
     pub fn new(size: u32, xref_type: XrefType) -> Xref {
         Xref {
             cross_reference_type: xref_type,
-            entries: BTreeMap::new(),
+            entries: XrefStore::new(),
             size,
         }
     }
@@ -337,5 +401,21 @@ fn bytes_needed(value: u64) -> usize {
         1
     } else {
         (64 - value.leading_zeros()).div_ceil(8) as usize
+    }
+}
+
+#[cfg(feature = "rayon")]
+impl<'a> rayon::iter::IntoParallelIterator for &'a XrefStore {
+    type Item = (&'a u32, &'a XrefEntry);
+    type Iter = rayon::iter::FilterMap<
+        rayon::slice::Iter<'a, Option<(u32, XrefEntry)>>,
+        fn(&'a Option<(u32, XrefEntry)>) -> Option<(&'a u32, &'a XrefEntry)>,
+    >;
+    fn into_par_iter(self) -> Self::Iter {
+        use rayon::prelude::*;
+        fn entry<'a>(entry: &'a Option<(u32, XrefEntry)>) -> Option<(&'a u32, &'a XrefEntry)> {
+            entry.as_ref().map(|(id, value)| (id, value))
+        }
+        self.entries.par_iter().filter_map(entry)
     }
 }
