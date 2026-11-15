@@ -1411,6 +1411,15 @@ fn operand(input: ParserInput) -> NomResult<Object> {
     Ok((rest, object))
 }
 
+#[inline]
+fn skip_content_space(input: ParserInput) -> ParserInput {
+    let count = input
+        .iter()
+        .take_while(|byte| is_whitespace(**byte))
+        .count();
+    &input[count..]
+}
+
 fn operation(input: ParserInput) -> NomResult<Operation> {
     let mut operands = Vec::new();
     let (rest, operator) = operation_into(input, &mut operands)?;
@@ -1453,19 +1462,36 @@ fn operation_into<'a>(
     out.clear();
     loop {
         let len = rest.len();
-        match operand(rest) {
-            Ok((next, value)) => {
-                if next.len() == len {
-                    return Err(nom::Err::Error(NomError::from_error_kind(
-                        rest,
-                        ErrorKind::Many0,
-                    )));
-                }
-                out.push(value);
-                rest = next;
+        match rest.first() {
+            Some(b'/') => {
+                let (next, name) = name_pdf(rest)?;
+                out.push(Object::Name(name));
+                rest = skip_content_space(next);
             }
-            Err(nom::Err::Error(_)) => break,
-            Err(error) => return Err(error),
+            Some(b'(') => {
+                let (next, string) = literal_string_pdf(rest)?;
+                out.push(Object::String(string, StringFormat::Literal));
+                rest = skip_content_space(next);
+            }
+            Some(b'0'..=b'9' | b'+' | b'-' | b'.') => {
+                let (next, number) = number(rest)?;
+                out.push(number);
+                rest = skip_content_space(next);
+            }
+            _ => match operand(rest) {
+                Ok((next, value)) => {
+                    if next.len() == len {
+                        return Err(nom::Err::Error(NomError::from_error_kind(
+                            rest,
+                            ErrorKind::Many0,
+                        )));
+                    }
+                    out.push(value);
+                    rest = next;
+                }
+                Err(nom::Err::Error(_)) => break,
+                Err(error) => return Err(error),
+            },
         }
     }
     let (rest, operator) = operator(rest)?;
