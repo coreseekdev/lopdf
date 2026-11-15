@@ -1257,25 +1257,47 @@ fn intern_operator(operator: &str) -> Cow<'static, str> {
 fn number(input: ParserInput) -> NomResult<Object> {
     let bytes = input;
     let mut index = 0;
-    if matches!(bytes.first(), Some(b'+' | b'-')) {
-        index = 1;
-    }
-    let mut saw_dot = false;
-    while let Some(&byte) = bytes.get(index) {
-        match byte {
-            b'0'..=b'9' => index += 1,
-            b'.' => {
-                saw_dot = true;
-                break;
-            }
-            _ => break,
+    let negative = match bytes.first() {
+        Some(b'-') => {
+            index = 1;
+            true
         }
+        Some(b'+') => {
+            index = 1;
+            false
+        }
+        _ => false,
+    };
+    let digits_start = index;
+    let mut value = 0u64;
+    let mut overflow = false;
+    while let Some(&byte) = bytes.get(index) {
+        if !byte.is_ascii_digit() {
+            break;
+        }
+        if !overflow {
+            match value
+                .checked_mul(10)
+                .and_then(|value| value.checked_add(u64::from(byte - b'0')))
+            {
+                Some(next) => value = next,
+                None => overflow = true,
+            }
+        }
+        index += 1;
     }
-    if saw_dot {
-        map(real, Object::Real).parse(input)
-    } else {
-        map(integer, Object::Integer).parse(input)
+    if bytes.get(index) == Some(&b'.') {
+        return map(real, Object::Real).parse(input);
     }
+    if index > digits_start && !overflow {
+        let signed = if negative {
+            (value as i64).wrapping_neg()
+        } else {
+            value as i64
+        };
+        return Ok((&bytes[index..], Object::Integer(signed)));
+    }
+    map(integer, Object::Integer).parse(input)
 }
 
 fn operand_value(input: ParserInput) -> NomResult<Object> {
