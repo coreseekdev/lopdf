@@ -1,37 +1,11 @@
 use crate::cmap_section::{
     ArrayOfTargetStrings, CMapParseError, CMapSection, CodeLen, SourceCode, SourceRangeMapping,
 };
-use crate::parser::{NomResult, ParserInput, comment, eol, hex_char};
-#[cfg(test)]
-use crate::parser::{dict_dup, dictionary, name};
-use nom::Parser;
-use nom::branch::alt;
-pub use nom::bytes::complete::tag;
-use nom::combinator::{map, opt};
-use nom::error::ParseError;
-use nom::multi::{fold_many0, fold_many1, many_m_n, separated_list1};
-use nom::sequence::{pair, separated_pair, terminated};
-use nom::{character::complete::digit1, sequence::delimited};
+use crate::parser::ParserInput;
 use std::str;
 
-impl<E> From<nom::Err<E>> for CMapParseError {
-    fn from(err: nom::Err<E>) -> Self {
-        match err {
-            nom::Err::Incomplete(_) => CMapParseError::Incomplete,
-            // normally nom::Err::Error is a recoverable error, but CMapParseError is the return type
-            // so we assume that there are no more parsing branches to check
-            nom::Err::Failure(_) | nom::Err::Error(_) => CMapParseError::Error,
-        }
-    }
-}
+pub(crate) type CMapResult<'a, T> = Result<(ParserInput<'a>, T), CMapParseError>;
 
-/// A ToUnicode CMap parsed section by section.
-///
-/// Sections are independent: a malformed `bfchar`/`bfrange` section is dropped
-/// without discarding the sections around it (pdfium `HandleBeginBFChar` /
-/// `HandleBeginBFRange`, cpdf_tounicodemap.cpp:180-259).  `usecmap` names the
-/// predefined Adobe collection a miss falls back to (pdfium
-/// cpdf_tounicodemap.cpp:154-173).
 #[derive(Debug, Default)]
 pub(crate) struct ParsedCMap {
     pub sections: Vec<CMapSection>,
@@ -39,99 +13,312 @@ pub(crate) struct ParsedCMap {
 }
 
 pub(crate) fn parse(stream_content: ParserInput) -> Result<ParsedCMap, CMapParseError> {
-    let result = cmap_stream(stream_content);
-    let result = result.map_err(CMapParseError::from)?;
-    Ok(result.1)
+    cmap_stream(stream_content).map(|(_, parsed)| parsed)
 }
 
-fn cmap_stream(input: ParserInput) -> NomResult<ParsedCMap> {
-    delimited(
-        cidinit_procset,
-        cmap_resource_dictionary,
-        // The trailing `end` is optional: producers truncate CMap streams
-        // mid-token (issue20930's ToUnicode ends at "CMapT"), and pdf.js's
-        // incremental parser keeps every entry parsed before the cut.
-        opt((tag(&b"end"[..]), multispace0)),
-    )
-    .parse(input)
+fn space0(input: ParserInput) -> CMapResult<'_, ()> {
+    let count = input
+        .iter()
+        .take_while(|byte| matches!(**byte, b' ' | b'\t' | b'\r' | b'\n'))
+        .count();
+    Ok((&input[count..], ()))
 }
 
-fn space0(input: ParserInput) -> NomResult<()> {
-    fold_many0(alt((tag(&b" "[..]), tag("\t"), eol)), || {}, |_, _| ()).parse(input)
+fn space1(input: ParserInput) -> CMapResult<'_, ()> {
+    let (rest, _) = space0(input)?;
+    if rest.len() == input.len() {
+        Err(CMapParseError::Error)
+    } else {
+        Ok((rest, ()))
+    }
 }
 
-fn space1(input: ParserInput) -> NomResult<()> {
-    fold_many1(alt((tag(&b" "[..]), tag("\t"), eol)), || {}, |_, _| ()).parse(input)
+fn comment(input: ParserInput) -> CMapResult<'_, ()> {
+    let rest = input.strip_prefix(b"%").ok_or(CMapParseError::Error)?;
+    let end = rest
+        .iter()
+        .position(|byte| matches!(*byte, b'\r' | b'\n'))
+        .ok_or(CMapParseError::Incomplete)?;
+    let rest = &rest[end..];
+    let rest = rest
+        .strip_prefix(b"\r\n")
+        .or_else(|| rest.strip_prefix(b"\n"))
+        .or_else(|| rest.strip_prefix(b"\r"))
+        .unwrap_or(rest);
+    Ok((rest, ()))
 }
 
-fn multispace0(input: ParserInput) -> NomResult<()> {
-    let space = tag(&b" "[..]).map(|_| ());
-    let tab = tag("\t").map(|_| ());
-    let eol = eol.map(|_| ());
-    fold_many0(alt((space, tab, eol, comment)), || {}, |_, _| ()).parse(input)
+fn multispace0(input: ParserInput) -> CMapResult<'_, ()> {
+    let mut rest = input;
+    loop {
+        let (next, _) = space0(rest)?;
+        rest = next;
+        if rest.first() != Some(&b'%') {
+            return Ok((rest, ()));
+        }
+        let (next, _) = comment(rest)?;
+        rest = next;
+    }
 }
 
-fn multispace1(input: ParserInput) -> NomResult<()> {
-    let space = tag(&b" "[..]).map(|_| ());
-    let tab = tag("\t").map(|_| ());
-    let eol = eol.map(|_| ());
-    fold_many1(alt((space, tab, eol, comment)), || {}, |_, _| ()).parse(input)
+fn multispace1(input: ParserInput) -> CMapResult<'_, ()> {
+    let (rest, _) = multispace0(input)?;
+    if rest.len() == input.len() {
+        Err(CMapParseError::Error)
+    } else {
+        Ok((rest, ()))
+    }
 }
 
-fn cidinit_procset(input: ParserInput) -> NomResult<()> {
-    (
-        opt(tag("\u{FEFF}".as_bytes())),
-        multispace0,
-        tag(&b"/CIDInit"[..]),
-        space0,
-        alt((tag(&b"/ProcSet"[..]), tag(&b"/Procset"[..]))),
-        space1,
-        tag(&b"findresource"[..]),
-        space1,
-        tag(&b"begin"[..]),
-        multispace1,
-    )
-        .parse(input)
-        .map(|(i, _)| (i, ()))
+fn token_end(input: ParserInput) -> usize {
+    match input.first() {
+        Some(b'<') if input.starts_with(b"<<") => 2,
+        Some(b'<') => input
+            .iter()
+            .position(|byte| *byte == b'>')
+            .map(|index| index + 1)
+            .unwrap_or(input.len()),
+        Some(b'(') => {
+            let mut depth = 0usize;
+            let mut index = 0usize;
+            let mut escaped = false;
+            while index < input.len() {
+                let byte = input[index];
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'(' {
+                    depth += 1;
+                } else if byte == b')' {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        index += 1;
+                        break;
+                    }
+                }
+                index += 1;
+            }
+            index.max(1)
+        }
+        Some(b'/') => input[1..]
+            .iter()
+            .position(|byte| is_token_delimiter(*byte) || byte.is_ascii_whitespace())
+            .map(|index| index + 1)
+            .unwrap_or(input.len()),
+        Some(b'>' | b']' | b'}' | b'{' | b'[') => 1,
+        _ => input
+            .iter()
+            .position(|byte| is_token_delimiter(*byte) || byte.is_ascii_whitespace())
+            .unwrap_or(input.len())
+            .max(1),
+    }
 }
 
-fn cmap_resource_dictionary(input: ParserInput) -> NomResult<ParsedCMap> {
-    let mut begin_parser = (
-        digit1,
-        space1,
-        tag(&b"dict"[..]),
-        space1,
-        tag(&b"begin"[..]),
-        multispace1,
-    );
-    let mut begin_cmap = (tag(&b"begincmap"[..]), multispace1);
-    let (rest, _) = begin_parser.parse(input)?;
-    let (rest, _) = begin_cmap.parse(rest)?;
-    let (rest, parsed) = cmap_data(rest)?;
-    // pdf.js and pdfium stop reading at `endcmap`; the epilogue after it
-    // varies in shape (issue20930 reorders `CMapType` before `currentdict`
-    // and omits `CMapName`; pdfapi2 misspells `currentdict`), so it is
-    // skipped word-wise instead of validated.
+fn next_token(input: ParserInput) -> CMapResult<'_, &[u8]> {
+    if input.is_empty() {
+        return Err(CMapParseError::Incomplete);
+    }
+    let end = token_end(input).min(input.len());
+    Ok((&input[end..], &input[..end]))
+}
+
+fn is_token_delimiter(byte: u8) -> bool {
+    b"()<>[]{}/%".contains(&byte)
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn decode_hex_pair(input: ParserInput) -> Option<(ParserInput, u8)> {
+    let high = hex_value(*input.first()?)?;
+    let low = hex_value(*input.get(1)?)?;
+    Some((&input[2..], high << 4 | low))
+}
+
+fn source_code(input: ParserInput) -> CMapResult<'_, (SourceCode, CodeLen)> {
+    let rest = input.strip_prefix(b"<").ok_or(CMapParseError::Error)?;
     let mut rest = rest;
+    let mut bytes = [0u8; 4];
+    let mut len = 0;
+    while !rest.starts_with(b">") {
+        if len == 4 {
+            return Err(CMapParseError::Error);
+        }
+        let (next, byte) = decode_hex_pair(rest).ok_or(CMapParseError::Error)?;
+        bytes[len] = byte;
+        len += 1;
+        rest = next;
+    }
+    if len == 0 {
+        return Err(CMapParseError::Error);
+    }
+    let rest = &rest[1..];
+    let code = bytes[..len]
+        .iter()
+        .rev()
+        .enumerate()
+        .map(|(index, byte)| 256u32.pow(index as u32) * u32::from(*byte))
+        .sum();
+    Ok((rest, (code, len as u8)))
+}
+
+fn code_range_pair(input: ParserInput) -> CMapResult<'_, (SourceCode, SourceCode, CodeLen)> {
+    let (rest, (begin, begin_len)) = source_code(input)?;
+    let (rest, _) = space0(rest)?;
+    let (rest, (end, end_len)) = source_code(rest)?;
+    if begin_len != end_len {
+        return Err(CMapParseError::Error);
+    }
+    Ok((rest, (begin, end, begin_len)))
+}
+
+fn target_string(input: ParserInput) -> CMapResult<'_, Vec<u16>> {
+    let rest = input.strip_prefix(b"<").ok_or(CMapParseError::Error)?;
+    let mut rest = rest;
+    let mut values = Vec::new();
+    loop {
+        let (next, _) = multispace0(rest)?;
+        rest = next;
+        if rest.starts_with(b">") {
+            return Ok((&rest[1..], values));
+        }
+        let (next, high) = decode_hex_pair(rest).ok_or(CMapParseError::Error)?;
+        let (next, low) = decode_hex_pair(next).ok_or(CMapParseError::Error)?;
+        values.push(u16::from(high) << 8 | u16::from(low));
+        if values.len() > 256 {
+            return Err(CMapParseError::Error);
+        }
+        rest = next;
+    }
+}
+
+fn range_target_array(input: ParserInput) -> CMapResult<'_, ArrayOfTargetStrings> {
+    let rest = input.strip_prefix(b"[").ok_or(CMapParseError::Error)?;
+    let (mut rest, _) = space0(rest)?;
+    let mut values = Vec::new();
+    loop {
+        if rest.starts_with(b"]") {
+            return Ok((&rest[1..], values));
+        }
+        let (next, value) = target_string(rest)?;
+        values.push(value);
+        let (after_space, _) = space0(next)?;
+        if after_space.starts_with(b"]") {
+            return Ok((&after_space[1..], values));
+        }
+        if after_space.len() == next.len() {
+            return Err(CMapParseError::Error);
+        }
+        rest = after_space;
+    }
+}
+
+fn bf_char_line(input: ParserInput) -> CMapResult<'_, ((SourceCode, CodeLen), Vec<u16>)> {
+    let (rest, _) = space0(input)?;
+    let (rest, source) = source_code(rest)?;
+    let (rest, _) = space0(rest)?;
+    let (rest, target) = target_string(rest)?;
+    let (rest, _) = multispace1(rest)?;
+    Ok((rest, (source, target)))
+}
+
+fn bf_range_line(input: ParserInput) -> CMapResult<'_, SourceRangeMapping> {
+    let (rest, _) = space0(input)?;
+    let (rest, range) = code_range_pair(rest)?;
+    let (rest, _) = space0(rest)?;
+    let (rest, targets) = if rest.starts_with(b"[") {
+        range_target_array(rest)?
+    } else {
+        let (rest, target) = target_string(rest)?;
+        (rest, vec![target])
+    };
+    let (rest, _) = multispace1(rest)?;
+    Ok((rest, (range, targets)))
+}
+
+fn collect_entries<'a, T>(
+    input: ParserInput<'a>,
+    end: &'static [u8],
+    parse_entry: impl Fn(ParserInput<'a>) -> CMapResult<'a, T> + Copy,
+) -> CMapResult<'a, Vec<T>> {
+    let mut rest = input;
+    let mut entries = Vec::new();
     loop {
         let (after_space, _) = multispace0(rest)?;
+        let at_end = after_space.starts_with(end)
+            && after_space
+                .get(end.len())
+                .is_none_or(|byte| byte.is_ascii_whitespace() || is_token_delimiter(*byte));
+        if at_end {
+            let after_end = &after_space[end.len()..];
+            let (after_end, _) = multispace0(after_end)?;
+            return Ok((after_end, entries));
+        }
         if after_space.is_empty() {
-            rest = after_space;
-            break;
+            return Err(CMapParseError::Incomplete);
         }
-        match next_token(after_space) {
-            Ok((after_token, _)) => rest = after_token,
-            Err(_) => break,
+        let (after_entry, entry) = parse_entry(after_space)?;
+        if after_entry.len() == after_space.len() {
+            return Err(CMapParseError::Error);
         }
+        entries.push(entry);
+        rest = after_entry;
     }
-    Ok((rest, parsed))
 }
 
-/// Scan CMap body tokens until `endcmap`, keeping every section that parses
-/// completely.  Unknown tokens (metadata, `def`, dictionaries, `usecmap`) are
-/// skipped one word at a time, matching pdfium's word-based parser
-/// (cpdf_tounicodemap.cpp:145-172).
-fn cmap_data(input: ParserInput) -> NomResult<ParsedCMap> {
+fn begin_section<'a>(
+    input: ParserInput<'a>,
+    keyword: &'static [u8],
+) -> Result<ParserInput<'a>, CMapParseError> {
+    let digits = input
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if digits == 0 {
+        return Err(CMapParseError::Error);
+    }
+    let rest = &input[digits..];
+    let (rest, _) = space1(rest)?;
+    let rest = rest
+        .strip_prefix(keyword)
+        .ok_or(CMapParseError::Error)?;
+    let (rest, _) = multispace1(rest)?;
+    Ok(rest)
+}
+
+fn codespace_range_section(input: ParserInput) -> CMapResult<'_, CMapSection> {
+    let rest = begin_section(input, b"begincodespacerange")?;
+    let (rest, ranges) = collect_entries(rest, b"endcodespacerange", code_range_pair)?;
+    Ok((rest, CMapSection::CsRange(ranges)))
+}
+
+fn bf_char_section(input: ParserInput) -> CMapResult<'_, CMapSection> {
+    let rest = begin_section(input, b"beginbfchar")?;
+    let (rest, mappings) = collect_entries(rest, b"endbfchar", bf_char_line)?;
+    Ok((rest, CMapSection::BfChar(mappings)))
+}
+
+fn bf_range_section(input: ParserInput) -> CMapResult<'_, CMapSection> {
+    let rest = begin_section(input, b"beginbfrange")?;
+    let (rest, mappings) = collect_entries(rest, b"endbfrange", bf_range_line)?;
+    Ok((rest, CMapSection::BfRange(mappings)))
+}
+
+fn try_section(input: ParserInput) -> Option<(ParserInput, CMapSection)> {
+    codespace_range_section(input)
+        .or_else(|_| bf_char_section(input))
+        .or_else(|_| bf_range_section(input))
+        .ok()
+}
+
+fn cmap_data(input: ParserInput) -> CMapResult<'_, ParsedCMap> {
     let mut rest = input;
     let mut sections = Vec::new();
     let mut usecmap = None;
@@ -140,10 +327,7 @@ fn cmap_data(input: ParserInput) -> NomResult<ParsedCMap> {
         let (after_space, _) = multispace0(rest)?;
         rest = after_space;
         if rest.is_empty() {
-            return Err(nom::Err::Failure(nom::error::Error::new(
-                input,
-                nom::error::ErrorKind::Eof,
-            )));
+            return Err(CMapParseError::Incomplete);
         }
         if rest.starts_with(b"endcmap") {
             return Ok((rest, ParsedCMap { sections, usecmap }));
@@ -168,343 +352,108 @@ fn cmap_data(input: ParserInput) -> NomResult<ParsedCMap> {
     }
 }
 
-/// Parse one complete section.  A malformed line drops the whole section,
-/// never part of it; the declared counts are hints, not gates.
-fn try_section(input: ParserInput) -> Option<(ParserInput, CMapSection)> {
-    alt((codespace_range_section, bf_char_section, bf_range_section))
-        .parse(input)
-        .ok()
-}
-
-/// Read one token for the tolerant scanner.  The returned slice borrows from
-/// the input and includes the `/` of a name.
-fn next_token<'a>(input: ParserInput<'a>) -> NomResult<'a, &'a [u8]> {
-    let first = *input.first().ok_or_else(|| {
-        nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Eof))
-    })?;
-    let end = match first {
-        b'<' if input.starts_with(b"<<") => 2,
-        b'<' => input
-            .iter()
-            .position(|byte| *byte == b'>')
-            .map(|index| index + 1)
-            .unwrap_or(input.len()),
-        b'(' => {
-            let mut depth = 0usize;
-            let mut index = 0usize;
-            let mut escaped = false;
-            while index < input.len() {
-                let byte = input[index];
-                if escaped {
-                    escaped = false;
-                } else if byte == b'\\' {
-                    escaped = true;
-                } else if byte == b'(' {
-                    depth += 1;
-                } else if byte == b')' {
-                    depth = depth.saturating_sub(1);
-                    if depth == 0 {
-                        index += 1;
-                        break;
-                    }
-                }
-                index += 1;
-            }
-            index.max(1)
-        }
-        b'/' => input[1..]
-            .iter()
-            .position(|byte| is_token_delimiter(*byte) || byte.is_ascii_whitespace())
-            .map(|index| index + 1)
-            .unwrap_or(input.len()),
-        b'>' | b']' | b'}' | b'{' | b'[' => 1,
-        _ => input
-            .iter()
-            .position(|byte| is_token_delimiter(*byte) || byte.is_ascii_whitespace())
-            .unwrap_or(input.len())
-            .max(1),
+fn cidinit_procset(input: ParserInput) -> CMapResult<'_, ()> {
+    let rest = input
+        .strip_prefix(b"\xef\xbb\xbf")
+        .unwrap_or(input);
+    let (rest, _) = multispace0(rest)?;
+    let rest = rest.strip_prefix(b"/CIDInit").ok_or(CMapParseError::Error)?;
+    let (rest, _) = space0(rest)?;
+    let rest = if let Some(rest) = rest.strip_prefix(b"/ProcSet") {
+        rest
+    } else {
+        rest.strip_prefix(b"/Procset").ok_or(CMapParseError::Error)?
     };
-    let (token, rest) = input.split_at(end.min(input.len()));
-    Ok((rest, token))
+    let (rest, _) = space1(rest)?;
+    let rest = rest
+        .strip_prefix(b"findresource")
+        .ok_or(CMapParseError::Error)?;
+    let (rest, _) = space1(rest)?;
+    let rest = rest.strip_prefix(b"begin").ok_or(CMapParseError::Error)?;
+    multispace1(rest)
 }
 
-fn is_token_delimiter(byte: u8) -> bool {
-    b"()<>[]{}/%".contains(&byte)
-}
-
-#[cfg(test)]
-fn cid_system_info(input: ParserInput) -> NomResult<()> {
-    // Note: Can array of CIDSystemInfo occur here?
-    // Normally in cmap this can be an array, but can it be also if this is a ToUnicode cmap?
-    (
-        tag(&b"/CIDSystemInfo"[..]),
-        multispace0,
-        alt((
-            terminated(dictionary, multispace0),
-            terminated(dict_dup, multispace1),
-        )),
-        tag(&b"def"[..]),
-        multispace1,
-    )
-        .parse(input)
-        .map(|(i, _)| (i, ()))
-}
-
-#[cfg(test)]
-fn cmap_name(input: ParserInput) -> NomResult<()> {
-    (
-        tag(&b"/CMapName"[..]),
-        space0,
-        name,
-        space1,
-        tag(&b"def"[..]),
-        multispace1,
-    )
-        .parse(input)
-        .map(|(i, _)| (i, ()))
-}
-
-#[cfg(test)]
-fn cmap_type(input: ParserInput) -> NomResult<()> {
-    (
-        tag(&b"/CMapType"[..]),
-        space1,
-        digit1,
-        space1,
-        tag(&b"def"[..]),
-        multispace1,
-    )
-        .parse(input)
-        .map(|(i, _)| (i, ()))
-}
-
-#[cfg(test)]
-fn cmap_version(input: ParserInput) -> NomResult<()> {
-    let version = (digit1, opt((tag(&b"."[..]), digit1)));
-    (
-        tag(&b"/CMapVersion"[..]),
-        space1,
-        version,
-        space1,
-        tag(&b"def"[..]),
-        multispace1,
-    )
-        .parse(input)
-        .map(|(i, _)| (i, ()))
-}
-
-#[cfg(test)]
-fn wmode(input: ParserInput) -> NomResult<()> {
-    (
-        tag(&b"/WMode"[..]),
-        space1,
-        digit1,
-        space1,
-        tag(&b"def"[..]),
-        multispace1,
-    )
-        .parse(input)
-        .map(|(i, _)| (i, ()))
-}
-
-#[cfg(test)]
-fn uidoffset(input: ParserInput) -> NomResult<()> {
-    (
-        tag(&b"/UIDOffset"[..]),
-        space1,
-        digit1,
-        space1,
-        tag(&b"def"[..]),
-        multispace1,
-    )
-        .parse(input)
-        .map(|(i, _)| (i, ()))
-}
-
-#[cfg(test)]
-fn xuid(input: ParserInput) -> NomResult<()> {
-    let array = (
-        tag(&b"["[..]),
-        separated_list1(space1, digit1),
-        tag(&b"]"[..]),
-    );
-    (
-        tag(&b"/XUID"[..]),
-        space1,
-        array,
-        space1,
-        tag(&b"def"[..]),
-        multispace1,
-    )
-        .parse(input)
-        .map(|(i, _)| (i, ()))
-}
-
-/// Collect entries until `end`, returning the position after the end keyword.
-/// A malformed entry aborts the whole section so a damaged `bfchar`/`bfrange`
-/// is dropped as a unit (pdfium `HandleBeginBFChar`, cpdf_tounicodemap.cpp:222-232).
-fn collect_entries<'a, T, F>(
-    input: ParserInput<'a>,
-    end: &'static [u8],
-    parse_entry: F,
-) -> NomResult<'a, Vec<T>>
-where
-    F: Fn(ParserInput<'a>) -> NomResult<'a, T>,
-{
-    let mut rest = input;
-    let mut entries = Vec::new();
+fn cmap_resource_dictionary(input: ParserInput) -> CMapResult<'_, ParsedCMap> {
+    let digits = input
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if digits == 0 {
+        return Err(CMapParseError::Error);
+    }
+    let rest = &input[digits..];
+    let (rest, _) = space1(rest)?;
+    let rest = rest.strip_prefix(b"dict").ok_or(CMapParseError::Error)?;
+    let (rest, _) = space1(rest)?;
+    let rest = rest.strip_prefix(b"begin").ok_or(CMapParseError::Error)?;
+    let (rest, _) = multispace1(rest)?;
+    let rest = rest
+        .strip_prefix(b"begincmap")
+        .ok_or(CMapParseError::Error)?;
+    let (mut rest, _) = multispace1(rest)?;
+    let (rest_after, parsed) = cmap_data(rest)?;
+    rest = rest_after;
     loop {
         let (after_space, _) = multispace0(rest)?;
-        let at_end = after_space.starts_with(end)
-            && after_space
-                .get(end.len())
-                .is_none_or(|byte| byte.is_ascii_whitespace() || is_token_delimiter(*byte));
-        if at_end {
-            let after_end = &after_space[end.len()..];
-            let (after_end, _) = opt(multispace1).parse(after_end)?;
-            return Ok((after_end, entries));
-        }
         if after_space.is_empty() {
-            return Err(nom::Err::Failure(nom::error::Error::new(
-                input,
-                nom::error::ErrorKind::Eof,
-            )));
+            return Ok((after_space, parsed));
         }
-        let (after_entry, entry) = parse_entry(after_space)?;
-        entries.push(entry);
-        rest = after_entry;
+        rest = match next_token(after_space) {
+            Ok((next, _)) => next,
+            Err(_) => return Ok((after_space, parsed)),
+        };
     }
 }
 
-fn parse_declared_count<'a>(
-    digits: &[u8],
-    input: ParserInput<'a>,
-) -> Result<usize, nom::Err<nom::error::Error<ParserInput<'a>>>> {
-    str::from_utf8(digits)
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .ok_or_else(|| {
-            nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Digit))
-        })
+fn cmap_stream(input: ParserInput) -> CMapResult<'_, ParsedCMap> {
+    let (rest, _) = cidinit_procset(input)?;
+    cmap_resource_dictionary(rest)
 }
 
-fn codespace_range_section(input: ParserInput) -> NomResult<CMapSection> {
-    let mut begin_section = (
-        digit1,
-        space1,
-        tag(&b"begincodespacerange"[..]),
-        multispace1,
-    );
-    let (rest, _) = begin_section.parse(input)?;
-    // pdfium ignores the declared codespace count and accepts every valid
-    // pair (cpdf_cmapparser.cpp:112-130); only the pair syntax is gated.
-    let (rest, ranges) = collect_entries(rest, b"endcodespacerange", |input| {
-        delimited(space0, code_range_pair, multispace1).parse(input)
-    })?;
-    Ok((rest, CMapSection::CsRange(ranges)))
+#[cfg(test)]
+#[cfg(test)]
+fn skip_metadata(input: ParserInput, key: &[u8]) -> CMapResult<'_, ()> {
+    let rest = input.strip_prefix(key).ok_or(CMapParseError::Error)?;
+    let (rest, _) = multispace0(rest)?;
+    let (rest, _) = next_token(rest)?;
+    let (rest, _) = multispace0(rest)?;
+    let rest = rest.strip_prefix(b"def").ok_or(CMapParseError::Error)?;
+    multispace1(rest)
 }
 
-fn code_range_pair(input: ParserInput) -> NomResult<(SourceCode, SourceCode, CodeLen)> {
-    let (rest_of_input, ((code_begin, code_len_beg), (code_end, code_len_end))) =
-        separated_pair(source_code, space0, source_code).parse(input)?;
-    if code_len_beg != code_len_end {
-        create_code_len_err(rest_of_input)
-    } else {
-        Ok((rest_of_input, (code_begin, code_end, code_len_beg)))
-    }
+#[cfg(test)]
+fn cid_system_info(input: ParserInput) -> CMapResult<'_, ()> {
+    skip_metadata(input, b"/CIDSystemInfo")
 }
 
-fn create_code_len_err<'a, T, E: ParseError<ParserInput<'a>>>(
-    input: ParserInput<'a>,
-) -> Result<T, nom::Err<E>> {
-    Err(nom::Err::Failure(nom::error::make_error(
-        input,
-        nom::error::ErrorKind::LengthValue,
-    )))
+#[cfg(test)]
+fn cmap_name(input: ParserInput) -> CMapResult<'_, ()> {
+    skip_metadata(input, b"/CMapName")
 }
 
-fn source_code(input: ParserInput) -> NomResult<(SourceCode, CodeLen)> {
-    let (rest_of_input, bytes) =
-        delimited(tag(&b"<"[..]), many_m_n(1, 4, hex_char), tag(&b">"[..])).parse(input)?;
-    let code_len = bytes.len();
-    let source_code = bytes
-        .into_iter()
-        .rev()
-        .zip(0..4)
-        .map(|(byte, i)| 256u32.pow(i) * byte as u32)
-        .sum();
-    Ok((rest_of_input, (source_code, code_len as u8)))
+#[cfg(test)]
+fn cmap_type(input: ParserInput) -> CMapResult<'_, ()> {
+    skip_metadata(input, b"/CMapType")
 }
 
-fn hex_u16(input: ParserInput) -> NomResult<u16> {
-    map(pair(hex_char, hex_char), |(h1, h2)| {
-        h1 as u16 * 256 + h2 as u16
-    })
-    .parse(input)
+#[cfg(test)]
+fn cmap_version(input: ParserInput) -> CMapResult<'_, ()> {
+    skip_metadata(input, b"/CMapVersion")
 }
 
-fn bf_char_section(input: ParserInput) -> NomResult<CMapSection> {
-    let mut begin_section = (digit1, space1, tag(&b"beginbfchar"[..]), multispace1);
-    let (rest, (count, ..)) = begin_section.parse(input)?;
-    let _ = parse_declared_count(count, input);
-    // pdf.js ignores the declared entry count and reads pairs until the
-    // `endbfchar` keyword (CMap.js bfchar loop); pdfium scans words the same
-    // way.  Producers mis-count constantly: issue9949.pdf declares
-    // `1 beginbfchar` ahead of ~70 entries, and gating on the count dropped
-    // the whole block — every Latin code the page uses unmapped — where
-    // pdf.js extracts 'Lorem ipsum'.  Empty sections (`0 beginbfchar` with
-    // no entries) still yield no mappings, so a shell CMap stays empty.
-    let (rest, bf_char_mappings) = collect_entries(rest, b"endbfchar", bf_char_line)?;
-    Ok((rest, CMapSection::BfChar(bf_char_mappings)))
+#[cfg(test)]
+fn wmode(input: ParserInput) -> CMapResult<'_, ()> {
+    skip_metadata(input, b"/WMode")
 }
 
-fn bf_char_line(input: ParserInput) -> NomResult<((SourceCode, CodeLen), Vec<u16>)> {
-    delimited(
-        space0,
-        separated_pair(source_code, space0, target_string),
-        multispace1,
-    )
-    .parse(input)
+#[cfg(test)]
+fn uidoffset(input: ParserInput) -> CMapResult<'_, ()> {
+    skip_metadata(input, b"/UIDOffset")
 }
 
-fn target_string(input: ParserInput) -> NomResult<Vec<u16>> {
-    // according to specification dstString can be up to 512 bytes
-    // in ToUnicode cmap these should be 2-byte big endian Unicode values
-    delimited(
-        tag(&b"<"[..]),
-        many_m_n(1, 256, terminated(hex_u16, multispace0)),
-        tag(&b">"[..]),
-    )
-    .parse(input)
-}
-
-fn bf_range_section(input: ParserInput) -> NomResult<CMapSection> {
-    let mut begin_section = (digit1, space1, tag(&b"beginbfrange"[..]), multispace1);
-    let (rest, (count, ..)) = begin_section.parse(input)?;
-    let _ = parse_declared_count(count, input);
-    // Same lenient count handling as the bfchar section: pdf.js and pdfium
-    // read entries until the end keyword; the declared count is a hint the
-    // generators do not honor.
-    let (rest, bf_range_mappings) = collect_entries(rest, b"endbfrange", bf_range_line)?;
-    Ok((rest, CMapSection::BfRange(bf_range_mappings)))
-}
-
-fn bf_range_line(input: ParserInput) -> NomResult<SourceRangeMapping> {
-    let bf_range_parser = separated_pair(
-        code_range_pair,
-        space0,
-        alt((target_string.map(|res| vec![res]), range_target_array)),
-    );
-    delimited(space0, bf_range_parser, multispace1).parse(input)
-}
-
-fn range_target_array(input: ParserInput) -> NomResult<ArrayOfTargetStrings> {
-    delimited(
-        (tag(&b"["[..]), space0),
-        separated_list1(space1, target_string),
-        (space0, tag(&b"]"[..])),
-    )
-    .parse(input)
+#[cfg(test)]
+fn xuid(input: ParserInput) -> CMapResult<'_, ()> {
+    skip_metadata(input, b"/XUID")
 }
 
 #[cfg(test)]
