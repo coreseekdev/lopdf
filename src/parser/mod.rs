@@ -1,4 +1,4 @@
-use super::{Dictionary, Object, ObjectId, Reader, Stream, StringFormat};
+use super::{Dictionary, Object, ObjectId, PdfName, Reader, Stream, StringFormat};
 use crate::Error;
 use crate::content::*;
 use crate::error;
@@ -557,17 +557,52 @@ fn dictionary_end(input: ParserInput) -> NomResult<()> {
     .parse(input)
 }
 
+fn dictionary_key(input: ParserInput) -> NomResult<'_, PdfName> {
+    let Some(rest) = input.strip_prefix(b"/") else {
+        return Err(nom::Err::Error(NomError::from_error_kind(
+            input,
+            ErrorKind::Tag,
+        )));
+    };
+    let mut end = 0;
+    while end < rest.len() && rest[end] != b'#' && is_regular(rest[end]) {
+        end += 1;
+    }
+    if end == rest.len() || rest[end] != b'#' {
+        return Ok((&rest[end..], PdfName::new(&rest[..end])));
+    }
+    let (rest, bytes) = name(input)?;
+    Ok((rest, PdfName::new(bytes)))
+}
+
 fn inner_dictionary(depth: usize) -> impl Fn(ParserInput) -> NomResult<Dictionary> {
     move |input| {
-        fold_many0(
-            pair(terminated(name, space), _direct_object(depth)),
-            || Dictionary::with_capacity(4),
-            |mut dict, (key, value)| {
-                dict.set(key, value);
-                dict
-            },
-        )
-        .parse(input)
+        let mut rest = input;
+        let mut dict = Dictionary::with_capacity(4);
+        loop {
+            let (next, _) = space(rest)?;
+            rest = next;
+            if rest.starts_with(b">>")
+                || rest.starts_with(b"endobj")
+                || (rest.starts_with(b"ID")
+                    && rest
+                        .get(2)
+                        .is_some_and(|byte| byte.is_ascii_whitespace()))
+            {
+                return Ok((rest, dict));
+            }
+            let (next, key) = dictionary_key(rest)?;
+            let (next, _) = space(next)?;
+            let (next, value) = _direct_object(depth).parse(next)?;
+            if next.len() == rest.len() {
+                return Err(nom::Err::Error(NomError::from_error_kind(
+                    rest,
+                    ErrorKind::Many0,
+                )));
+            }
+            dict.set(key, value);
+            rest = next;
+        }
     }
 }
 
