@@ -69,7 +69,61 @@ type ObjectMap = IndexMap<PdfName, Object, FxBuildHasher>;
 /// `get_mut` copy the map first when it is shared.  Readers therefore share
 /// storage transparently while writers keep value semantics.
 #[derive(Clone, Default, PartialEq)]
-pub struct Dictionary(Arc<ObjectMap>);
+pub struct Dictionary(Arc<DictRepr>);
+
+const DICT_INLINE_MAX: usize = 8;
+
+#[derive(Debug, Clone, PartialEq)]
+enum DictRepr {
+    Inline(Vec<(PdfName, Object)>),
+    Map(ObjectMap),
+}
+
+impl Default for DictRepr {
+    fn default() -> Self {
+        Self::Inline(Vec::new())
+    }
+}
+
+/// Borrowed dictionary iterator over both small inline and large map storage.
+pub enum DictIter<'a> {
+    Inline(std::slice::Iter<'a, (PdfName, Object)>),
+    Map(indexmap::map::Iter<'a, PdfName, Object>),
+}
+
+impl<'a> Iterator for DictIter<'a> {
+    type Item = (&'a PdfName, &'a Object);
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Inline(iter) => iter.next().map(|(key, value)| (key, value)),
+            Self::Map(iter) => iter.next(),
+        }
+    }
+}
+
+impl DoubleEndedIterator for DictIter<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Inline(iter) => iter.next_back().map(|(key, value)| (key, value)),
+            Self::Map(iter) => iter.next_back(),
+        }
+    }
+}
+
+pub enum DictIterMut<'a> {
+    Inline(std::slice::IterMut<'a, (PdfName, Object)>),
+    Map(indexmap::map::IterMut<'a, PdfName, Object>),
+}
+
+impl<'a> Iterator for DictIterMut<'a> {
+    type Item = (&'a PdfName, &'a mut Object);
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Inline(iter) => iter.next().map(|(key, value)| (&*key, value)),
+            Self::Map(iter) => iter.next(),
+        }
+    }
+}
 
 /// Stream object
 /// Warning - all streams must be indirect objects, while
@@ -611,22 +665,26 @@ impl fmt::Debug for Object {
 
 impl Dictionary {
     pub fn new() -> Dictionary {
-        static EMPTY: std::sync::OnceLock<Arc<ObjectMap>> = std::sync::OnceLock::new();
-        Dictionary(Arc::clone(
-            EMPTY.get_or_init(|| Arc::new(ObjectMap::default())),
-        ))
+        static EMPTY: std::sync::OnceLock<Arc<DictRepr>> = std::sync::OnceLock::new();
+        Dictionary(Arc::clone(EMPTY.get_or_init(|| {
+            Arc::new(DictRepr::Inline(Vec::new()))
+        })))
     }
 
     pub fn with_capacity(capacity: usize) -> Dictionary {
-        Dictionary(Arc::new(ObjectMap::with_capacity_and_hasher(
-            capacity,
-            FxBuildHasher,
-        )))
+        if capacity <= DICT_INLINE_MAX {
+            Dictionary(Arc::new(DictRepr::Inline(Vec::with_capacity(capacity))))
+        } else {
+            Dictionary(Arc::new(DictRepr::Map(ObjectMap::with_capacity_and_hasher(
+                capacity,
+                FxBuildHasher,
+            ))))
+        }
     }
 
     #[inline]
     pub fn has(&self, key: &[u8]) -> bool {
-        self.0.contains_key(key)
+        self.get_opt(key).is_some()
     }
 
     pub fn get(&self, key: &[u8]) -> Result<&Object> {
@@ -639,7 +697,13 @@ impl Dictionary {
     /// optional keys per glyph/page.
     #[inline]
     pub fn get_opt(&self, key: &[u8]) -> Option<&Object> {
-        self.0.get(key)
+        match &*self.0 {
+            DictRepr::Inline(entries) => entries
+                .iter()
+                .find(|(name, _)| name.as_slice() == key)
+                .map(|(_, value)| value),
+            DictRepr::Map(map) => map.get(key),
+        }
     }
 
     /// Extract object from dictionary, dereferencing
@@ -649,9 +713,16 @@ impl Dictionary {
     }
 
     pub fn get_mut(&mut self, key: &[u8]) -> Result<&mut Object> {
-        Arc::make_mut(&mut self.0)
-            .get_mut(key)
-            .ok_or_else(|| Error::DictKey(String::from_utf8_lossy(key).to_string()))
+        match Arc::make_mut(&mut self.0) {
+            DictRepr::Inline(entries) => entries
+                .iter_mut()
+                .find(|(name, _)| name.as_slice() == key)
+                .map(|(_, value)| value)
+                .ok_or_else(|| Error::DictKey(String::from_utf8_lossy(key).to_string())),
+            DictRepr::Map(map) => map
+                .get_mut(key)
+                .ok_or_else(|| Error::DictKey(String::from_utf8_lossy(key).to_string())),
+        }
     }
 
     #[inline]
@@ -660,19 +731,58 @@ impl Dictionary {
         K: Into<PdfName>,
         V: Into<Object>,
     {
-        Arc::make_mut(&mut self.0).insert(key.into(), value.into());
+        let key = key.into();
+        let value = value.into();
+        match Arc::make_mut(&mut self.0) {
+            DictRepr::Inline(entries) => {
+                if let Some((_, slot)) = entries.iter_mut().find(|(name, _)| *name == key) {
+                    *slot = value;
+                    return;
+                }
+                if entries.len() < DICT_INLINE_MAX {
+                    entries.push((key, value));
+                    return;
+                }
+                let mut map = ObjectMap::with_capacity_and_hasher(
+                    entries.len() + 1,
+                    FxBuildHasher,
+                );
+                for (key, value) in entries.drain(..) {
+                    map.insert(key, value);
+                }
+                map.insert(key, value);
+                self.0 = Arc::new(DictRepr::Map(map));
+            }
+            DictRepr::Map(map) => {
+                map.insert(key, value);
+            }
+        }
     }
 
     pub fn len(&self) -> usize {
-        self.0.len()
+        match &*self.0 {
+            DictRepr::Inline(entries) => entries.len(),
+            DictRepr::Map(map) => map.len(),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.len() == 0
+        self.len() == 0
     }
 
     pub fn remove(&mut self, key: &[u8]) -> Option<Object> {
-        Arc::make_mut(&mut self.0).swap_remove(key)
+        match Arc::make_mut(&mut self.0) {
+            DictRepr::Inline(entries) => entries
+                .iter()
+                .position(|(name, _)| name.as_slice() == key)
+                .map(|index| entries.swap_remove(index).1),
+            DictRepr::Map(map) => map.swap_remove(key),
+        }
+    }
+
+    /// Stable identity of the shared dictionary storage.
+    pub fn as_ptr(&self) -> *const () {
+        Arc::as_ptr(&self.0) as *const ()
     }
 
     pub fn has_type(&self, type_name: &[u8]) -> bool {
@@ -685,12 +795,18 @@ impl Dictionary {
             .or_else(|_| self.get(b"Linearized").and(Ok(b"Linearized")))
     }
 
-    pub fn iter(&'_ self) -> indexmap::map::Iter<'_, PdfName, Object> {
-        self.0.iter()
+    pub fn iter(&'_ self) -> DictIter<'_> {
+        match &*self.0 {
+            DictRepr::Inline(entries) => DictIter::Inline(entries.iter()),
+            DictRepr::Map(map) => DictIter::Map(map.iter()),
+        }
     }
 
-    pub fn iter_mut(&'_ mut self) -> indexmap::map::IterMut<'_, PdfName, Object> {
-        Arc::make_mut(&mut self.0).iter_mut()
+    pub fn iter_mut(&'_ mut self) -> DictIterMut<'_> {
+        match Arc::make_mut(&mut self.0) {
+            DictRepr::Inline(entries) => DictIterMut::Inline(entries.iter_mut()),
+            DictRepr::Map(map) => DictIterMut::Map(map.iter_mut()),
+        }
     }
 
     pub fn get_font_encoding<'a>(&'a self, doc: &'a Document) -> Result<Encoding<'a>> {
@@ -896,77 +1012,39 @@ impl Dictionary {
     }
 
     pub fn extend(&mut self, other: &Dictionary) {
-        let keep_both_objects = |new_dict: &mut ObjectMap,
-                                 key: &PdfName,
-                                 value: &Object,
-                                 old_value: Object| {
-            let mut final_array;
-
-            match value {
-                Object::Array(array) => {
-                    final_array = Vec::with_capacity(array.len() + 1);
-                    final_array.push(old_value);
-                    final_array.extend(array.to_owned());
-                }
-                _ => {
-                    final_array = vec![value.to_owned(), old_value];
-                }
-            }
-
-            new_dict.insert(key.clone(), Object::Array(final_array));
-        };
-
-        let new_dict = Arc::make_mut(&mut self.0);
-        new_dict.reserve_exact(other.0.len());
-
-        for (key, value) in other.0.iter() {
-            if let Some(old_value) = new_dict.get(key) {
-                let old_value = old_value.to_owned();
+        for (key, value) in other.iter() {
+            if let Some(old_value) = self.get_opt(key.as_slice()).cloned() {
                 match (&old_value, value) {
                     (Object::Dictionary(old_dict), Object::Dictionary(dict)) => {
-                        let mut replaced_dict = old_dict.to_owned();
-                        replaced_dict.extend(dict);
-                        new_dict.insert(key.clone(), Object::Dictionary(replaced_dict));
+                        let mut replaced = old_dict.clone();
+                        replaced.extend(dict);
+                        self.set(key.clone(), Object::Dictionary(replaced));
                     }
                     (Object::Array(old_array), Object::Array(array)) => {
-                        let mut replaced_array = old_array.to_owned();
-                        replaced_array.extend(array.to_owned());
-                        new_dict.insert(key.clone(), Object::Array(replaced_array));
-                    }
-                    (Object::Integer(_), Object::Integer(_))
-                    | (Object::Real(_), Object::Real(_))
-                    | (Object::String(_, _), Object::String(_, _))
-                    | (Object::Reference(_), Object::Reference(_)) => {
-                        // Two values of the same scalar type keep both, oldest first.
-                        new_dict.insert(
-                            key.clone(),
-                            Object::Array(vec![old_value, value.to_owned()]),
-                        );
+                        let mut replaced = old_array.clone();
+                        replaced.extend(array.iter().cloned());
+                        self.set(key.clone(), Object::Array(replaced));
                     }
                     (Object::Null, _)
                     | (Object::Boolean(_), _)
                     | (Object::Name(_), _)
-                    | (Object::Stream(_), _) => {
-                        new_dict.insert(key.clone(), old_value);
+                    | (Object::Stream(_), _) => {}
+                    (_, Object::Array(array)) => {
+                        let mut merged = Vec::with_capacity(array.len() + 1);
+                        merged.push(old_value);
+                        merged.extend(array.iter().cloned());
+                        self.set(key.clone(), Object::Array(merged));
                     }
-                    (_, _) => keep_both_objects(new_dict, key, value, old_value),
+                    (_, _) => {
+                        self.set(key.clone(), Object::Array(vec![value.clone(), old_value]));
+                    }
                 }
             } else {
-                new_dict.insert(key.clone(), value.to_owned());
+                self.set(key.clone(), value.clone());
             }
         }
-
     }
 
-    /// Return a reference to the inner  [`IndexMap`].
-    pub fn as_hashmap(&self) -> &ObjectMap {
-        self.0.as_ref()
-    }
-
-    /// Return a mut reference to the inner [`IndexMap`].
-    pub fn as_hashmap_mut(&mut self) -> &mut ObjectMap {
-        Arc::make_mut(&mut self.0)
-    }
 }
 
 #[macro_export]
@@ -998,28 +1076,32 @@ impl fmt::Debug for Dictionary {
 
 impl IntoIterator for Dictionary {
     type Item = (PdfName, Object);
-    type IntoIter = indexmap::map::IntoIter<PdfName, Object>;
+    type IntoIter = std::vec::IntoIter<(PdfName, Object)>;
 
     fn into_iter(self) -> Self::IntoIter {
-        Arc::unwrap_or_clone(self.0).into_iter()
+        let entries = match Arc::unwrap_or_clone(self.0) {
+            DictRepr::Inline(entries) => entries,
+            DictRepr::Map(map) => map.into_iter().collect(),
+        };
+        entries.into_iter()
     }
 }
 
 impl<'a> IntoIterator for &'a Dictionary {
     type Item = (&'a PdfName, &'a Object);
-    type IntoIter = indexmap::map::Iter<'a, PdfName, Object>;
+    type IntoIter = DictIter<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.0.iter()
+        self.iter()
     }
 }
 
 impl<'a> IntoIterator for &'a mut Dictionary {
     type Item = (&'a PdfName, &'a mut Object);
-    type IntoIter = indexmap::map::IterMut<'a, PdfName, Object>;
+    type IntoIter = DictIterMut<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
-        Arc::make_mut(&mut self.0).iter_mut()
+        self.iter_mut()
     }
 }
 
