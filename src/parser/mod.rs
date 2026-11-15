@@ -560,6 +560,24 @@ fn dictionary_end(input: ParserInput) -> NomResult<()> {
     .parse(input)
 }
 
+fn name_pdf(input: ParserInput) -> NomResult<'_, PdfName> {
+    let Some(rest) = input.strip_prefix(b"/") else {
+        return Err(nom::Err::Error(NomError::from_error_kind(
+            input,
+            ErrorKind::Tag,
+        )));
+    };
+    let mut end = 0;
+    while end < rest.len() && rest[end] != b'#' && is_regular(rest[end]) {
+        end += 1;
+    }
+    if end == rest.len() || rest[end] != b'#' {
+        return Ok((&rest[end..], PdfName::new(&rest[..end])));
+    }
+    let (rest, bytes) = name(input)?;
+    Ok((rest, PdfName::new(bytes)))
+}
+
 fn dictionary_key(input: ParserInput) -> NomResult<'_, PdfName> {
     let Some(rest) = input.strip_prefix(b"/") else {
         return Err(nom::Err::Error(NomError::from_error_kind(
@@ -842,7 +860,7 @@ fn reference(input: ParserInput) -> NomResult<Object> {
 
 fn _direct_objects(depth: usize) -> impl Fn(ParserInput) -> NomResult<Object> {
     move |input| match input.first() {
-        Some(b'/') => map(name, |bytes| Object::Name(bytes.into())).parse(input),
+        Some(b'/') => map(name_pdf, Object::Name).parse(input),
         Some(b'(') => map(literal_string, Object::string_literal).parse(input),
         Some(b'<') => {
             if input.get(1) == Some(&b'<') {
@@ -1347,7 +1365,7 @@ fn number(input: ParserInput) -> NomResult<Object> {
 #[inline]
 fn operand_value(input: ParserInput) -> NomResult<Object> {
     match input.first() {
-        Some(b'/') => map(name, |bytes| Object::Name(bytes.into())).parse(input),
+        Some(b'/') => map(name_pdf, Object::Name).parse(input),
         Some(b'(') => map(literal_string, Object::string_literal).parse(input),
         Some(b'<') => {
             if input.get(1) == Some(&b'<') {
