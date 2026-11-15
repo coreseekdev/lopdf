@@ -1028,70 +1028,110 @@ pub fn binary_mark(input: ParserInput) -> Option<Vec<u8>> {
 
 /// Decode CrossReferenceTable
 fn xref(input: ParserInput, strict: bool) -> NomResult<Xref> {
-    // ISO 32000-1 s7.5.4 requires 20-byte entries ending in SP CR, SP LF or CR LF, but many
-    // generators emit 19-byte entries ending in a bare LF, which qpdf, pikepdf, PDFium and
-    // PDF.js accept. The conforming forms come first in the `alt` so a bare CR never matches
-    // the CR of a CR LF and strands its LF.
-    let xref_eol = move |i| {
-        let conforming = alt((tag(&b" \r"[..]), tag(&b" \n"[..]), tag(&b"\r\n"[..])));
-        if strict {
-            map(conforming, |_| ()).parse(i)
-        } else {
-            map(alt((conforming, tag(&b"\n"[..]), tag(&b"\r"[..]))), |_| ()).parse(i)
+    let mut rest = input
+        .strip_prefix(b"xref")
+        .ok_or_else(|| nom::Err::Error(NomError::from_error_kind(input, ErrorKind::Tag)))?;
+    if rest.starts_with(b" ") {
+        rest = &rest[1..];
+    }
+    rest = xref_eol(rest, strict)?;
+    let mut xref = Xref::new(0, XrefType::CrossReferenceTable);
+    loop {
+        rest = space(rest)?.0;
+        if rest.starts_with(b"trailer") {
+            return Ok((rest, xref));
+        }
+        let (next, start) = unsigned_int::<usize>(rest)?;
+        let Some(next) = next.strip_prefix(b" ") else {
+            return Err(nom::Err::Error(NomError::from_error_kind(
+                next,
+                ErrorKind::Tag,
+            )));
+        };
+        let (next, count) = unsigned_int::<u32>(next)?;
+        let next = xref_eol(next.strip_prefix(b" ").unwrap_or(next), strict)?;
+        rest = next;
+        for index in 0..count as usize {
+            let entry = match xref_entry(rest, strict) {
+                Ok((next, entry)) => {
+                    rest = next;
+                    entry
+                }
+                Err(nom::Err::Error(_)) => break,
+                Err(error) => return Err(error),
+            };
+            let ((offset, generation), is_normal) = entry;
+            let Some(id) = start.checked_add(index).and_then(|id| u32::try_from(id).ok()) else {
+                continue;
+            };
+            if is_normal {
+                if let Ok(generation) = generation.try_into() {
+                    xref.insert(id, XrefEntry::Normal { offset, generation });
+                }
+            } else {
+                xref.insert(
+                    id,
+                    XrefEntry::Free {
+                        generation: generation.try_into().unwrap_or(0),
+                    },
+                );
+            }
+        }
+    }
+}
+
+fn xref_eol(input: ParserInput, strict: bool) -> Result<ParserInput, nom::Err<NomError<'_>>> {
+    if let Some(rest) = input
+        .strip_prefix(b" \r")
+        .or_else(|| input.strip_prefix(b" \n"))
+        .or_else(|| input.strip_prefix(b"\r\n"))
+    {
+        return Ok(rest);
+    }
+    if !strict {
+        if let Some(rest) = input
+            .strip_prefix(b"\n")
+            .or_else(|| input.strip_prefix(b"\r"))
+        {
+            return Ok(rest);
+        }
+    }
+    Err(nom::Err::Error(NomError::from_error_kind(
+        input,
+        ErrorKind::Tag,
+    )))
+}
+
+fn xref_entry(
+    input: ParserInput,
+    strict: bool,
+) -> Result<(ParserInput, ((u32, u32), bool)), nom::Err<NomError<'_>>> {
+    let (rest, offset) = unsigned_int::<u32>(input)?;
+    let Some(rest) = rest.strip_prefix(b" ") else {
+        return Err(nom::Err::Error(NomError::from_error_kind(
+            rest,
+            ErrorKind::Tag,
+        )));
+    };
+    let (rest, generation) = unsigned_int::<u32>(rest)?;
+    let Some(rest) = rest.strip_prefix(b" ") else {
+        return Err(nom::Err::Error(NomError::from_error_kind(
+            rest,
+            ErrorKind::Tag,
+        )));
+    };
+    let (rest, is_normal) = match rest.first() {
+        Some(b'n') => (&rest[1..], true),
+        Some(b'f') => (&rest[1..], false),
+        _ => {
+            return Err(nom::Err::Error(NomError::from_error_kind(
+                rest,
+                ErrorKind::OneOf,
+            )))
         }
     };
-    let xref_entry = pair(
-        separated_pair(unsigned_int, tag(&b" "[..]), unsigned_int::<u32>),
-        delimited(tag(&b" "[..]), map(one_of("nf"), |k| k == 'n'), xref_eol),
-    );
-
-    let xref_section = pair(
-        separated_pair(unsigned_int::<usize>, tag(&b" "[..]), unsigned_int::<u32>),
-        preceded(pair(opt(tag(&b" "[..])), eol), many0(xref_entry)),
-    );
-
-    delimited(
-        pair(tag(&b"xref"[..]), preceded(opt(tag(&b" "[..])), eol)),
-        fold_many1(
-            xref_section,
-            || -> Xref { Xref::new(0, XrefType::CrossReferenceTable) },
-            |mut xref, ((start, _count), entries)| {
-                let mut skipped = 0usize;
-                for (index, ((offset, generation), is_normal)) in entries.into_iter().enumerate() {
-                    // `start` is untrusted: `start + index` can overflow, and a `start`
-                    // above u32::MAX would truncate into a valid-looking object number.
-                    let Some(id) = start.checked_add(index).and_then(|id| u32::try_from(id).ok())
-                    else {
-                        skipped += 1;
-                        continue;
-                    };
-                    if is_normal {
-                        if let Ok(generation) = generation.try_into() {
-                            xref.insert(id, XrefEntry::Normal { offset, generation });
-                        }
-                    } else {
-                        // A newer free entry must shadow an older live entry
-                        // from /Prev; otherwise the object is resurrected.
-                        xref.insert(
-                            id,
-                            XrefEntry::Free {
-                                generation: generation.try_into().unwrap_or(0),
-                            },
-                        );
-                    }
-                }
-                if skipped > 0 {
-                    log::warn!(
-                        "cross-reference subsection starting at {start} has {skipped} entr{} with an object number beyond u32; skipping",
-                        if skipped == 1 { "y" } else { "ies" }
-                    );
-                }
-                xref
-            },
-        ),
-        space,
-    )
-    .parse(input)
+    let rest = xref_eol(rest, strict)?;
+    Ok((rest, ((offset, generation), is_normal)))
 }
 
 fn trailer(input: ParserInput) -> NomResult<Dictionary> {
