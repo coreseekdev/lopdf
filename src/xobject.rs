@@ -26,13 +26,16 @@ pub struct PdfImage<'a> {
 
 pub fn form(boundingbox: Vec<f32>, matrix: Vec<f32>, content: Vec<u8>) -> Stream {
     let mut dict = Dictionary::new();
-    dict.set("Type", Object::Name(b"XObject".to_vec()));
-    dict.set("Subtype", Object::Name(b"Form".to_vec()));
+    dict.set("Type", Object::Name(b"XObject".to_vec().into()));
+    dict.set("Subtype", Object::Name(b"Form".to_vec().into()));
     dict.set(
         "BBox",
         Object::Array(boundingbox.into_iter().map(Object::Real).collect()),
     );
-    dict.set("Matrix", Object::Array(matrix.into_iter().map(Object::Real).collect()));
+    dict.set(
+        "Matrix",
+        Object::Array(matrix.into_iter().map(Object::Real).collect()),
+    );
     let mut xobject = Stream::new(dict, content);
     // Ignore any compression error.
     let _ = xobject.compress();
@@ -67,8 +70,12 @@ pub fn image_from(buffer: Vec<u8>) -> Result<Stream> {
         ColorType::Rgb16 => (16, b"DeviceRGB".to_vec()),
         ColorType::Rgba16 => (16, b"DeviceRGB".to_vec()),
         // f32 not supported, maybe JPXDecode?
-        ColorType::Rgb32F => return Err(Error::Unimplemented("ColorType::Rgb32F is not supported")),
-        ColorType::Rgba32F => return Err(Error::Unimplemented("ColorType::Rgba32F is not supported")),
+        ColorType::Rgb32F => {
+            return Err(Error::Unimplemented("ColorType::Rgb32F is not supported"));
+        }
+        ColorType::Rgba32F => {
+            return Err(Error::Unimplemented("ColorType::Rgba32F is not supported"));
+        }
         // The above ColorType is all the types currently supported by the image crate
         // But ColorType is #[non_exhaustive], there may be new types supported in the future
         _ => {
@@ -132,8 +139,12 @@ pub fn image_from(buffer: Vec<u8>) -> Result<Stream> {
                 .flat_map(|&pixel| pixel.to_be_bytes()) // convert each 16-bit pixel to big-endian bytes
                 .collect(),
             // f32 not supported, maybe JPXDecode?
-            ColorType::Rgb32F => return Err(Error::Unimplemented("ColorType::Rgb32F is not supported")),
-            ColorType::Rgba32F => return Err(Error::Unimplemented("ColorType::Rgba32F is not supported")),
+            ColorType::Rgb32F => {
+                return Err(Error::Unimplemented("ColorType::Rgb32F is not supported"));
+            }
+            ColorType::Rgba32F => {
+                return Err(Error::Unimplemented("ColorType::Rgba32F is not supported"));
+            }
             // The above ColorType is all the types currently supported by the image crate
             // But ColorType is #[non_exhaustive], there may be new types supported in the future
             _ => {
@@ -172,7 +183,8 @@ fn insert_image() {
     let pages = doc.get_pages();
     let page_id = *pages.get(&1).expect(&format!("Page {} not exist.", 1));
     let img = xobject::image("assets/pdf_icon.jpg").unwrap();
-    doc.insert_image(page_id, img, (100.0, 210.0), (400.0, 225.0)).unwrap();
+    doc.insert_image(page_id, img, (100.0, 210.0), (400.0, 225.0))
+        .unwrap();
     doc.save("test_5_image.pdf").unwrap();
 }
 
@@ -182,9 +194,12 @@ async fn insert_image() {
     use super::xobject;
     let mut doc = Document::load("assets/example.pdf").await.unwrap();
     let pages = doc.get_pages();
-    let page_id = *pages.get(&1).unwrap_or_else(|| panic!("Page {} not exist.", 1));
+    let page_id = *pages
+        .get(&1)
+        .unwrap_or_else(|| panic!("Page {} not exist.", 1));
     let img = xobject::image("assets/pdf_icon.jpg").unwrap();
-    doc.insert_image(page_id, img, (100.0, 210.0), (400.0, 225.0)).unwrap();
+    doc.insert_image(page_id, img, (100.0, 210.0), (400.0, 225.0))
+        .unwrap();
     doc.save("test_5_image.pdf").unwrap();
 }
 
@@ -216,7 +231,14 @@ fn embed_supported_color_type() -> Result<()> {
 
         let cm_operation = Operation::new(
             "cm",
-            vec![width.into(), 0.into(), 0.into(), height.into(), 0.into(), 0.into()],
+            vec![
+                width.into(),
+                0.into(),
+                0.into(),
+                height.into(),
+                0.into(),
+                0.into(),
+            ],
         );
 
         let do_operation = Operation::new("Do", vec![Object::Name(img_name.as_bytes().to_vec())]);

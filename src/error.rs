@@ -13,6 +13,10 @@ pub enum Error {
     )]
     Unimplemented(&'static str),
 
+    /// A range source could not supply bytes for on-demand loading.
+    #[error("range source failed: {0}")]
+    RangeSource(String),
+
     /// An Object has the wrong type, e.g. the Object is an Array where a Name would be expected.
     #[error("object has wrong type; expected type {expected} but found type {found}")]
     ObjectType {
@@ -20,7 +24,10 @@ pub enum Error {
         found: &'static str,
     },
     #[error("dictionary has wrong type: ")]
-    DictType { expected: &'static str, found: String },
+    DictType {
+        expected: &'static str,
+        found: String,
+    },
     /// PDF document is already encrypted.
     #[error("PDF document is already encrypted")]
     AlreadyEncrypted,
@@ -67,6 +74,9 @@ pub enum Error {
     /// Invalid password provided for encrypted PDF.
     #[error("invalid password for encrypted PDF")]
     InvalidPassword,
+    /// A password is required to open this encrypted PDF.
+    #[error("PDF document is encrypted; a password is required")]
+    PasswordRequired,
     /// Missing xref entry.
     #[error("missing xref entry")]
     MissingXrefEntry,
@@ -89,7 +99,9 @@ pub enum Error {
     /// Traversal of the document's object graph (e.g. a `/Kids`, `/First`, or `/Parent` chain)
     /// exceeded the supported nesting depth.
     /// This might indicate a reference cycle or a maliciously deep structure.
-    #[error("object graph traversal reached the nesting-depth limit, may indicate a reference cycle")]
+    #[error(
+        "object graph traversal reached the nesting-depth limit, may indicate a reference cycle"
+    )]
     RecursionLimit,
     /// Decoding text string failed.
     #[error("decoding text string failed")]
@@ -103,10 +115,6 @@ pub enum Error {
     /// Found object ID does not match expected object ID.
     #[error("found object ID does not match expected object ID")]
     ObjectIdMismatch,
-    /// A new object ID was needed, but [`Document::max_id`](crate::Document::max_id) is already
-    /// `u32::MAX`.
-    #[error("object ID overflow: the next object number would exceed {}", u32::MAX)]
-    ObjectIdOverflow,
     /// Error when handling images.
     #[cfg(feature = "embed_image")]
     #[error("image error")]
@@ -138,17 +146,16 @@ pub enum DecompressError {
     AsciiHex(&'static str),
     #[error("applying the stream predictor failed: {0}")]
     Predictor(&'static str),
+    /// A `/Filter` chain that would have to decode data after a terminal image
+    /// codec (or that names a non-decoder in a non-terminal position).
+    #[error("invalid filter chain: {0}")]
+    FilterChain(&'static str),
     /// The decompressed output exceeded the allowed size limit. This guards
     /// against decompression bombs: a small compressed stream that inflates to
     /// an enormous size (potentially exhausting memory). The `limit` is the
     /// maximum number of output bytes that were permitted.
     #[error("decompressed output exceeded the {limit}-byte limit (possible decompression bomb)")]
     MemoryLimitExceeded { limit: usize },
-    /// The stream names more filters than [`Stream::MAX_FILTERS`](crate::Stream::MAX_FILTERS).
-    /// Every filter can produce as much output as the size limit allows, so the number of
-    /// filters bounds the work of decoding one stream.
-    #[error("stream has {count} filters, more than the {limit} that are decoded")]
-    TooManyFilters { count: usize, limit: usize },
 }
 
 #[derive(Error, Debug)]

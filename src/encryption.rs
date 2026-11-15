@@ -3,11 +3,10 @@ pub mod crypt_filters;
 mod pkcs5;
 mod rc4;
 
-use crate::{Dictionary, Document, Error, Object, ObjectId};
+use crate::{Dictionary, Document, Error, Object, ObjectId, Stream};
 use bitflags::bitflags;
 use crypt_filters::*;
 use std::collections::BTreeMap;
-use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -136,8 +135,7 @@ impl Permissions {
     }
 }
 
-/// `Debug` prints `***` for the passwords and the file encryption key.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum EncryptionVersion<'a> {
     /// (PDF 1.4; deprecated in PDF 2.0) Indicates the use of encryption of data using the RC4 or
     /// AES algorithms with a file encryption key length of 40 bits.
@@ -202,9 +200,7 @@ pub enum EncryptionVersion<'a> {
     },
 }
 
-/// `Debug` prints `***` for the file encryption key. Use
-/// [`file_encryption_key`](Self::file_encryption_key) to read it.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct EncryptionState {
     pub(crate) version: i64,
     pub(crate) revision: i64,
@@ -214,151 +210,24 @@ pub struct EncryptionState {
     pub(crate) file_encryption_key: Vec<u8>,
     pub(crate) stream_filter: Vec<u8>,
     pub(crate) string_filter: Vec<u8>,
+    /// `/EFF`: the crypt filter used for embedded-file streams when present
+    /// (pdf.js `#getStreamFilterName`, crypto.js:824-831).
+    pub(crate) embedded_file_filter: Option<Vec<u8>>,
     pub(crate) owner_value: Vec<u8>,
     pub(crate) owner_encrypted: Vec<u8>,
     pub(crate) user_value: Vec<u8>,
     pub(crate) user_encrypted: Vec<u8>,
     pub(crate) permissions: Permissions,
     pub(crate) permission_encrypted: Vec<u8>,
+    /// True when the credential that unlocked the document authenticated as
+    /// the owner password (pdfium `owner_unlocked_`, cpdf_security_handler.cpp
+    /// 213-220,467-497).
+    pub(crate) owner_authenticated: bool,
     /// Object id of the `/Encrypt` dictionary in the previous revision, recorded
     /// during `Document::decrypt_raw` before the reference is stripped from the
     /// trailer. Used by `IncrementalDocument` to restore the `/Encrypt` reference
     /// in the appended trailer.
     pub(crate) encrypt_object_id: Option<ObjectId>,
-}
-
-impl fmt::Debug for EncryptionVersion<'_> {
-    #[allow(deprecated)]
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::V1 {
-                document,
-                owner_password: _,
-                user_password: _,
-                permissions,
-            } => f
-                .debug_struct("V1")
-                .field("document", document)
-                .field("owner_password", &"***")
-                .field("user_password", &"***")
-                .field("permissions", permissions)
-                .finish(),
-            Self::V2 {
-                document,
-                owner_password: _,
-                user_password: _,
-                key_length,
-                permissions,
-            } => f
-                .debug_struct("V2")
-                .field("document", document)
-                .field("owner_password", &"***")
-                .field("user_password", &"***")
-                .field("key_length", key_length)
-                .field("permissions", permissions)
-                .finish(),
-            Self::V4 {
-                document,
-                encrypt_metadata,
-                crypt_filters,
-                stream_filter,
-                string_filter,
-                owner_password: _,
-                user_password: _,
-                permissions,
-            } => f
-                .debug_struct("V4")
-                .field("document", document)
-                .field("encrypt_metadata", encrypt_metadata)
-                .field("crypt_filters", crypt_filters)
-                .field("stream_filter", stream_filter)
-                .field("string_filter", string_filter)
-                .field("owner_password", &"***")
-                .field("user_password", &"***")
-                .field("permissions", permissions)
-                .finish(),
-            Self::R5 {
-                encrypt_metadata,
-                crypt_filters,
-                file_encryption_key: _,
-                stream_filter,
-                string_filter,
-                owner_password: _,
-                user_password: _,
-                permissions,
-            } => f
-                .debug_struct("R5")
-                .field("encrypt_metadata", encrypt_metadata)
-                .field("crypt_filters", crypt_filters)
-                .field("file_encryption_key", &"***")
-                .field("stream_filter", stream_filter)
-                .field("string_filter", string_filter)
-                .field("owner_password", &"***")
-                .field("user_password", &"***")
-                .field("permissions", permissions)
-                .finish(),
-            Self::V5 {
-                encrypt_metadata,
-                crypt_filters,
-                file_encryption_key: _,
-                stream_filter,
-                string_filter,
-                owner_password: _,
-                user_password: _,
-                permissions,
-            } => f
-                .debug_struct("V5")
-                .field("encrypt_metadata", encrypt_metadata)
-                .field("crypt_filters", crypt_filters)
-                .field("file_encryption_key", &"***")
-                .field("stream_filter", stream_filter)
-                .field("string_filter", string_filter)
-                .field("owner_password", &"***")
-                .field("user_password", &"***")
-                .field("permissions", permissions)
-                .finish(),
-        }
-    }
-}
-
-impl fmt::Debug for EncryptionState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Bind every field, so that a new one has to be printed or hidden here on purpose.
-        let Self {
-            version,
-            revision,
-            key_length,
-            encrypt_metadata,
-            crypt_filters,
-            file_encryption_key: _,
-            stream_filter,
-            string_filter,
-            owner_value,
-            owner_encrypted,
-            user_value,
-            user_encrypted,
-            permissions,
-            permission_encrypted,
-            encrypt_object_id,
-        } = self;
-        f.debug_struct("EncryptionState")
-            .field("version", version)
-            .field("revision", revision)
-            .field("key_length", key_length)
-            .field("encrypt_metadata", encrypt_metadata)
-            .field("crypt_filters", crypt_filters)
-            .field("file_encryption_key", &"***")
-            .field("stream_filter", stream_filter)
-            .field("string_filter", string_filter)
-            .field("owner_value", owner_value)
-            .field("owner_encrypted", owner_encrypted)
-            .field("user_value", user_value)
-            .field("user_encrypted", user_encrypted)
-            .field("permissions", permissions)
-            .field("permission_encrypted", permission_encrypted)
-            .field("encrypt_object_id", encrypt_object_id)
-            .finish()
-    }
 }
 
 /// Fields shared by the AES-256 variants (`R5` and `V5`), which differ only
@@ -528,7 +397,10 @@ type CryptFilters = (
 
 /// Build the [`EncryptionState`] for one of the MD5-based revisions. The
 /// per-object crypt filters are present only from `V4` on.
-fn r4_state(params: R4Params<'_>, crypt_filters: Option<CryptFilters>) -> Result<EncryptionState, DecryptionError> {
+fn r4_state(
+    params: R4Params<'_>,
+    crypt_filters: Option<CryptFilters>,
+) -> Result<EncryptionState, DecryptionError> {
     let R4Params {
         document,
         owner_password,
@@ -546,7 +418,8 @@ fn r4_state(params: R4Params<'_>, crypt_filters: Option<CryptFilters>) -> Result
     let owner_password = algorithm.sanitize_password_r4(owner_password)?;
     let user_password = algorithm.sanitize_password_r4(user_password)?;
 
-    algorithm.owner_value = algorithm.compute_hashed_owner_password_r4(Some(&owner_password), &user_password)?;
+    algorithm.owner_value =
+        algorithm.compute_hashed_owner_password_r4(Some(&owner_password), &user_password)?;
 
     algorithm.user_value = match user_hash {
         UserHash::R2 => algorithm.compute_hashed_user_password_r2(document, &user_password)?,
@@ -579,7 +452,11 @@ fn r4_state(params: R4Params<'_>, crypt_filters: Option<CryptFilters>) -> Result
 /// differ only in version, revision and key length. The permissions are
 /// corrected here, because every revision records them in `/P`.
 fn r4_algorithm(
-    key_length: Option<usize>, version: i64, revision: i64, encrypt_metadata: bool, permissions: Permissions,
+    key_length: Option<usize>,
+    version: i64,
+    revision: i64,
+    encrypt_metadata: bool,
+    permissions: Permissions,
 ) -> PasswordAlgorithm {
     PasswordAlgorithm {
         encrypt_metadata,
@@ -593,7 +470,10 @@ fn r4_algorithm(
 
 /// An [`EncryptionState`] for the AES-256 revisions (5 and 6), which run the
 /// same Algorithms 8, 9 and 10 and differ only in the revision recorded.
-fn aes256_state(revision: i64, params: Aes256Params<'_>) -> Result<EncryptionState, DecryptionError> {
+fn aes256_state(
+    revision: i64,
+    params: Aes256Params<'_>,
+) -> Result<EncryptionState, DecryptionError> {
     let Aes256Params {
         encrypt_metadata,
         crypt_filters,
@@ -622,7 +502,8 @@ fn aes256_state(revision: i64, params: Aes256Params<'_>) -> Result<EncryptionSta
     let owner_password = algorithm.sanitize_password_r6(owner_password)?;
     let user_password = algorithm.sanitize_password_r6(user_password)?;
 
-    let (user_value, user_encrypted) = algorithm.compute_hashed_user_password_r6(file_encryption_key, user_password)?;
+    let (user_value, user_encrypted) =
+        algorithm.compute_hashed_user_password_r6(file_encryption_key, user_password)?;
 
     algorithm.user_value = user_value;
     algorithm.user_encrypted = user_encrypted;
@@ -650,6 +531,8 @@ fn aes256_state(revision: i64, params: Aes256Params<'_>) -> Result<EncryptionSta
         user_encrypted: algorithm.user_encrypted,
         permissions: algorithm.permissions,
         permission_encrypted: algorithm.permission_encrypted,
+        owner_authenticated: false,
+        embedded_file_filter: None,
         encrypt_object_id: None,
     })
 }
@@ -703,8 +586,24 @@ impl EncryptionState {
         self.user_encrypted.as_ref()
     }
 
+    /// The effective permissions of this state.
+    ///
+    /// Owner authentication reports every permission, and the standard
+    /// handler normalises the reserved bits (pdfium `GetPermissions`,
+    /// cpdf_security_handler.cpp:222-233, Table 3.20): `P & 0xFFFFFFFC |
+    /// 0xFFFFF0C0`.
     pub fn permissions(&self) -> Permissions {
-        self.permissions
+        let bits = if self.owner_authenticated {
+            u32::MAX
+        } else {
+            self.permissions.bits() as u32
+        };
+        Permissions::from_bits_retain(u64::from((bits & 0xFFFF_FFFC) | 0xFFFF_F0C0))
+    }
+
+    /// Whether the document was unlocked with the owner password.
+    pub fn is_owner_authenticated(&self) -> bool {
+        self.owner_authenticated
     }
 
     pub fn permission_encrypted(&self) -> &[u8] {
@@ -740,11 +639,19 @@ impl EncryptionState {
         }
 
         let algorithm = PasswordAlgorithm::try_from(document)?;
+        // The empty credential is a user credential only (pdfium
+        // `UnlockOwner`, cpdf_security_handler.cpp:231-243).
+        let owner_authenticated = !password.as_ref().is_empty()
+            && algorithm
+                .authenticate_owner_password(document, password.as_ref())
+                .is_ok();
         // Either password may be given, but only the user password (or, for an owner password,
         // the value Algorithm 7 recovers from `/O`) is valid input to Algorithm 2.
         // See `PasswordAlgorithm::resolve_password_for_key_derivation`.
-        let resolved_password = algorithm.resolve_password_for_key_derivation(document, password)?;
-        let file_encryption_key = algorithm.compute_file_encryption_key(document, resolved_password)?;
+        let resolved_password =
+            algorithm.resolve_password_for_key_derivation(document, password)?;
+        let file_encryption_key =
+            algorithm.compute_file_encryption_key(document, resolved_password)?;
 
         let mut crypt_filters = document.get_crypt_filters();
 
@@ -766,11 +673,24 @@ impl EncryptionState {
             user_encrypted: algorithm.user_encrypted,
             permissions: algorithm.permissions,
             permission_encrypted: algorithm.permission_encrypted,
+            owner_authenticated,
             ..Default::default()
         };
 
-        // StmF and StrF are meaningful only when the value of V is 4 (PDF 1.5) or 5 (PDF 2.0).
+        // StmF, StrF and EFF are meaningful only when the value of V is 4
+        // (PDF 1.5) or 5 (PDF 2.0).  Their default is Identity (pdf.js
+        // crypto.js:1131-1140), not the legacy RC4 cipher.
         if algorithm.version == 4 || algorithm.version == 5 {
+            state.stream_filter = b"Identity".to_vec();
+            state.string_filter = b"Identity".to_vec();
+            if let Ok(eff) = document
+                .get_encrypted()
+                .and_then(|dict| dict.get(b"EFF"))
+                .and_then(|object| object.as_name())
+            {
+                state.embedded_file_filter = Some(eff.to_vec());
+            }
+
             if let Ok(stream_filter) = document
                 .get_encrypted()
                 .and_then(|dict| dict.get(b"StmF"))
@@ -791,19 +711,78 @@ impl EncryptionState {
         Ok(state)
     }
 
+    /// Build the state for a file whose effective crypt filters are Identity
+    /// (`/V` 4/5, `/StmF` and `/StrF` both `/Identity`).
+    ///
+    /// No password is checked: pdfium's `OnInit` returns success when the
+    /// effective cipher is `kNone` (cpdf_security_handler.cpp:199-204), since
+    /// page content and strings are plaintext; only `/EFF` embedded-file
+    /// streams are encrypted.  The file encryption key stays empty because
+    /// Identity never consumes it, and `/EFF` is preserved so embedded files
+    /// still resolve their declared filter.
+    pub fn decode_identity(document: &Document) -> Result<Self, Error> {
+        let encrypted = document
+            .get_encrypted()
+            .map_err(|_| DecryptionError::MissingEncryptDictionary)?;
+        let version = encrypted
+            .get(b"V")
+            .and_then(Object::as_i64)
+            .map_err(|_| DecryptionError::InvalidType)?;
+        if version < 4 {
+            return Err(DecryptionError::InvalidVersion.into());
+        }
+        let name = |key: &[u8]| {
+            encrypted
+                .get(key)
+                .and_then(Object::as_name)
+                .map(<[u8]>::to_vec)
+                .ok()
+        };
+        let value = |key: &[u8]| {
+            encrypted
+                .get(key)
+                .and_then(Object::as_str)
+                .map(<[u8]>::to_vec)
+                .unwrap_or_default()
+        };
+        let permissions = encrypted.get(b"P").and_then(Object::as_i64).unwrap_or(-1);
+        Ok(Self {
+            version,
+            revision: encrypted.get(b"R").and_then(Object::as_i64).unwrap_or(4),
+            key_length: encrypted
+                .get(b"Length")
+                .and_then(Object::as_i64)
+                .ok()
+                .and_then(|length| usize::try_from(length).ok()),
+            encrypt_metadata: encrypted
+                .get(b"EncryptMetadata")
+                .and_then(Object::as_bool)
+                .unwrap_or(true),
+            crypt_filters: document.get_crypt_filters(),
+            file_encryption_key: Vec::new(),
+            stream_filter: b"Identity".to_vec(),
+            string_filter: b"Identity".to_vec(),
+            embedded_file_filter: name(b"EFF"),
+            owner_value: value(b"O"),
+            owner_encrypted: value(b"OE"),
+            user_value: value(b"U"),
+            user_encrypted: value(b"UE"),
+            permissions: Permissions::from_bits_retain(permissions as u64).correct_bits(),
+            owner_authenticated: false,
+            permission_encrypted: value(b"Perms"),
+            encrypt_object_id: None,
+        })
+    }
+
     pub fn encode(&self) -> Result<Dictionary, DecryptionError> {
         let mut encrypted = Dictionary::new();
 
-        encrypted.set(b"Filter", Object::Name(b"Standard".to_vec()));
+        encrypted.set(b"Filter", Object::Name(b"Standard".to_vec().into()));
 
         encrypted.set(b"V", Object::Integer(self.version));
         encrypted.set(b"R", Object::Integer(self.revision));
 
-        // PDF 2.0 deprecates /Length for V 5, whose key is always 256 bits, but readers such as
-        // LibreOffice still need it: without it they decrypt to blank pages.
-        if self.version >= 5 {
-            encrypted.set(b"Length", Object::Integer(256));
-        } else if let Some(key_length) = self.key_length {
+        if let Some(key_length) = self.key_length {
             encrypted.set(b"Length", Object::Integer(key_length as i64));
         }
 
@@ -823,48 +802,64 @@ impl EncryptionState {
             for (name, crypt_filter) in &self.crypt_filters {
                 let mut filter = Dictionary::new();
 
-                filter.set(b"Type", Object::Name(b"CryptFilter".to_vec()));
-                filter.set(b"CFM", Object::Name(crypt_filter.method().to_vec()));
-
-                // The AESV3 key length in bytes, as qpdf writes it.
-                if crypt_filter.method() == b"AESV3" {
-                    filter.set(b"Length", Object::Integer(32));
-                }
+                filter.set(b"Type", Object::Name(b"CryptFilter".to_vec().into()));
+                filter.set(b"CFM", Object::Name(crypt_filter.method().to_vec().into()));
 
                 filters.set(name.to_vec(), Object::Dictionary(filter));
             }
 
             encrypted.set(b"CF", Object::Dictionary(filters));
-            encrypted.set(b"StmF", Object::Name(self.stream_filter.clone()));
-            encrypted.set(b"StrF", Object::Name(self.string_filter.clone()));
+            encrypted.set(b"StmF", Object::Name(self.stream_filter.clone().into()));
+            encrypted.set(b"StrF", Object::Name(self.string_filter.clone().into()));
         }
 
         if self.revision >= 5 {
             encrypted.set(b"OE", Object::string_literal(self.owner_encrypted.clone()));
             encrypted.set(b"UE", Object::string_literal(self.user_encrypted.clone()));
-            encrypted.set(b"Perms", Object::string_literal(self.permission_encrypted.clone()));
+            encrypted.set(
+                b"Perms",
+                Object::string_literal(self.permission_encrypted.clone()),
+            );
         }
 
         Ok(encrypted)
     }
 
+    /// The crypt filter a stream uses by default.  `/EFF` overrides `/StmF`
+    /// for embedded files (pdf.js `#getStreamFilterName`, crypto.js:824-831).
     pub fn get_stream_filter(&self) -> Arc<dyn CryptFilter> {
-        self.filter_named(&self.stream_filter)
+        self.get_stream_filter_for(false)
+    }
+
+    pub fn get_stream_filter_for(&self, embedded_file: bool) -> Arc<dyn CryptFilter> {
+        let name = if embedded_file {
+            self.embedded_file_filter
+                .as_deref()
+                .unwrap_or(&self.stream_filter)
+        } else {
+            &self.stream_filter
+        };
+        self.filter_for_name(name)
     }
 
     pub fn get_string_filter(&self) -> Arc<dyn CryptFilter> {
-        self.filter_named(&self.string_filter)
+        self.filter_for_name(&self.string_filter)
     }
 
-    fn filter_named(&self, name: &[u8]) -> Arc<dyn CryptFilter> {
-        // Identity is predefined rather than declared in /CF, and is the V4/V5 default.
-        if self.version >= 4 && (name.is_empty() || name == b"Identity") {
+    fn filter_for_name(&self, name: &[u8]) -> Arc<dyn CryptFilter> {
+        // V1/V2 carry no /StmF; the default is the legacy RC4 cipher.
+        if name.is_empty() {
+            return Arc::new(Rc4CryptFilter);
+        }
+        // Identity is built in even when /CF does not declare it, and an
+        // unknown name resolves to Identity in pdf.js (crypto.js:1305-1316).
+        if name == b"Identity" {
             return Arc::new(IdentityCryptFilter);
         }
         self.crypt_filters
             .get(name)
             .cloned()
-            .unwrap_or(Arc::new(Rc4CryptFilter))
+            .unwrap_or_else(|| Arc::new(IdentityCryptFilter))
     }
 }
 
@@ -876,13 +871,46 @@ enum Direction {
 }
 
 /// Applies the document's crypt filter to every string and stream in `obj`,
-/// recursing into arrays and dictionaries to reach the ones nested inside.
-/// The exemptions are the same in both directions (ISO 32000-1, 7.6).
+/// recursing through arrays and dictionaries to reach the ones nested inside.
+///
+/// Encryption and decryption are the same walk over the object with the
+/// filter run forwards or backwards, so they share this traversal; the spec
+/// rules about which objects are exempt are identical in both directions
+/// (ISO 32000-1, 7.6). A direction that ever needs a different exemption
+/// belongs in its own wrapper rather than in a test of `direction` here.
+/// `/Type /Sig`, `/FT /Sig` (or `DocTimeStamp`), or a `/ByteRange` with
+/// `/Contents` marks a dictionary whose contents are a signature blob.
+fn is_signature_dictionary(dictionary: &Dictionary) -> bool {
+    let kind = dictionary
+        .get(b"Type")
+        .ok()
+        .and_then(|object| object.as_name().ok())
+        .or_else(|| {
+            dictionary
+                .get(b"FT")
+                .ok()
+                .and_then(|object| object.as_name().ok())
+        });
+    if matches!(kind, Some(b"Sig") | Some(b"DocTimeStamp")) {
+        return true;
+    }
+    dictionary.has(b"ByteRange") && dictionary.has(b"Contents")
+}
+
 fn transform_object(
-    state: &EncryptionState, obj_id: ObjectId, obj: &mut Object, direction: Direction,
+    state: &EncryptionState,
+    obj_id: ObjectId,
+    obj: &mut Object,
+    direction: Direction,
 ) -> Result<(), DecryptionError> {
-    // A cross-reference stream and the strings in its dictionary are exempt.
-    if obj.as_stream().is_ok_and(|stream| stream.dict.has_type(b"XRef")) {
+    // The cross-reference stream shall not be encrypted and strings appearing in the
+    // cross-reference stream dictionary shall not be encrypted.
+    let is_xref_stream = obj
+        .as_stream()
+        .map(|stream| stream.dict.has_type(b"XRef"))
+        .unwrap_or(false);
+
+    if is_xref_stream {
         return Ok(());
     }
 
@@ -891,118 +919,156 @@ fn transform_object(
         return Ok(());
     }
 
-    // A stream's DecodeParms /Crypt /Name may override the document's default crypt filter;
-    // Identity is used when absent.
+    // A stream's `/Crypt` filter may name a different crypt filter in the
+    // `/DecodeParms` entry that belongs to it; Identity is used when the name
+    // is absent (pdf.js parser.js:868-880, crypto.js:1305-1316).
     let override_crypt_filter = obj
         .as_stream()
         .ok()
-        .filter(|stream| {
-            stream
-                .filters()
-                .map(|filters| filters.contains(&&b"Crypt"[..]))
-                .unwrap_or(false)
-        })
-        .and_then(|stream| stream.dict.get(b"DecodeParms").ok())
-        .and_then(|object| object.as_dict().ok())
-        .map(|dict| {
-            dict.get(b"Name")
-                .and_then(|object| object.as_name())
-                .ok()
-                .and_then(|name| state.crypt_filters.get(name).cloned())
-                .unwrap_or(Arc::new(IdentityCryptFilter))
-        });
+        .and_then(|stream| crypt_filter_override(state, stream));
 
-    match obj {
-        Object::Array(objects) => transform_all(state, obj_id, objects.iter_mut(), direction),
-        Object::Dictionary(dict) => transform_dictionary(state, obj_id, dict, direction),
-        // The dictionary's strings use the string filter, its content the stream filter (#603).
-        Object::Stream(stream) => {
-            let dict_result = transform_dictionary(state, obj_id, &mut stream.dict, direction);
-            let filter = override_crypt_filter.unwrap_or_else(|| state.get_stream_filter());
-            let content = transform_bytes(state, obj_id, &*filter, &stream.content, direction);
+    // Retrieve the payload and the crypt filter to use to transform it.
+    let (mut crypt_filter, payload) = match obj {
+        // Every string and stream is covered, so recurse into arrays and dictionaries
+        // to reach the ones nested inside.
+        Object::Array(objects) => {
+            for obj in objects {
+                transform_object(state, obj_id, obj, direction)?;
+            }
 
-            content.map(|content| stream.set_content(content)).and(dict_result)
+            return Ok(());
         }
-        Object::String(content, _) => {
-            let transformed = transform_bytes(state, obj_id, &*state.get_string_filter(), content, direction)?;
+        Object::Dictionary(objects) => {
+            // A signature dictionary's /Contents holds the PKCS#7 blob and
+            // must stay ciphertext (pdfium DecryptObjectTree,
+            // cpdf_crypto_handler.cpp:253-333).  Names are not encrypted, so
+            // /Type and /FT can be checked before recursing.
+            let signature = is_signature_dictionary(objects);
+            for (key, obj) in objects.iter_mut() {
+                if signature && key.as_slice() == b"Contents" {
+                    continue;
+                }
+                transform_object(state, obj_id, obj, direction)?;
+            }
 
-            *content = transformed;
-
-            Ok(())
+            return Ok(());
         }
+        // Encryption applies to all strings and streams in the document's PDF file. We return the
+        // crypt filter and the content here.
+        Object::String(content, _) => (state.get_string_filter(), content.as_slice()),
+        Object::Stream(stream) => (
+            state.get_stream_filter_for(stream.dict.has_type(b"EmbeddedFile")),
+            stream.content.as_slice(),
+        ),
         // Encryption is not applied to other object types such as integers and boolean values.
-        _ => Ok(()),
-    }
-}
-
-/// Transforms each object, remembering the first error instead of abandoning the rest.
-fn transform_all<'a>(
-    state: &EncryptionState, obj_id: ObjectId, objects: impl Iterator<Item = &'a mut Object>, direction: Direction,
-) -> Result<(), DecryptionError> {
-    let mut first_error = None;
-
-    for object in objects {
-        if let Err(error) = transform_object(state, obj_id, object, direction) {
-            first_error.get_or_insert(error);
+        _ => {
+            return Ok(());
         }
+    };
+
+    // If the stream object specifies its own crypt filter, override the default one with the one
+    // from this stream object.  `Some(None)` means `/Crypt` without a usable name, i.e. Identity.
+    if let Some(filter) = override_crypt_filter {
+        crypt_filter = filter.unwrap_or_else(|| Arc::new(IdentityCryptFilter));
     }
 
-    first_error.map_or(Ok(()), Err)
-}
+    // Compute the key from the original file encryption key and the object identifier to use for
+    // the corresponding object.
+    let key = crypt_filter.compute_key(&state.file_encryption_key, obj_id)?;
 
-/// Transforms a dictionary's entries, leaving the `/Contents` of a signature
-/// dictionary in clear (ISO 32000-1, 7.6.2, issue #608).
-fn transform_dictionary(
-    state: &EncryptionState, obj_id: ObjectId, dict: &mut Dictionary, direction: Direction,
-) -> Result<(), DecryptionError> {
-    let is_signature = is_signature_dictionary(dict);
-    let entries = dict.iter_mut().filter_map(|(key, object)| {
-        if is_signature && key == b"Contents" {
-            None
-        } else {
-            Some(object)
+    let transformed = match direction {
+        Direction::Encrypt => crypt_filter.encrypt(&key, payload)?,
+        Direction::Decrypt => crypt_filter.decrypt(&key, payload)?,
+    };
+
+    // Store the result in the object.
+    match obj {
+        Object::Stream(stream) => {
+            stream.set_content(transformed);
+            // Decryption yields plaintext, so the Crypt filter has done its
+            // job; dropping it lets the remaining filters decode the payload
+            // (pdf.js keeps filtering after `Crypt`, parser.js:728-735).
+            if matches!(direction, Direction::Decrypt) {
+                strip_crypt_filter(stream);
+            }
         }
-    });
+        Object::String(content, _) => *content = transformed.into(),
+        _ => (),
+    }
 
-    transform_all(state, obj_id, entries, direction)
+    Ok(())
 }
 
-/// Whether `dict` is a signature or timestamp dictionary, whose `/Contents` is not
-/// encrypted. `/Type` is optional; without it, both `/ByteRange` and `/Contents` are required.
-fn is_signature_dictionary(dict: &Dictionary) -> bool {
-    dict.has_type(b"Sig") || dict.has_type(b"DocTimeStamp") || (dict.has(b"ByteRange") && dict.has(b"Contents"))
+/// The crypt filter named by the `/DecodeParms` entry belonging to the
+/// stream's `/Crypt` filter.  The outer `Option` says whether the filter chain
+/// contains `Crypt`; the inner one is `None` for Identity (missing, unnamed or
+/// unknown name).
+fn crypt_filter_override(
+    state: &EncryptionState,
+    stream: &Stream,
+) -> Option<Option<Arc<dyn CryptFilter>>> {
+    let filters = stream.filters().ok()?;
+    let index = filters.iter().position(|filter| *filter == b"Crypt")?;
+    let params = match stream.dict.get(b"DecodeParms") {
+        Ok(Object::Array(params)) => params.get(index).and_then(|param| param.as_dict().ok()),
+        Ok(Object::Dictionary(params)) => Some(params),
+        _ => None,
+    };
+    let name = params
+        .and_then(|dict| dict.get(b"Name").ok())
+        .and_then(|object| object.as_name().ok());
+    Some(name.map(|name| state.filter_for_name(name)))
 }
 
-/// Applies `filter` to `data` with the key derived for `obj_id`.
-fn transform_bytes(
-    state: &EncryptionState, obj_id: ObjectId, filter: &dyn CryptFilter, data: &[u8], direction: Direction,
-) -> Result<Vec<u8>, DecryptionError> {
-    let key = filter.compute_key(&state.file_encryption_key, obj_id)?;
-
-    match direction {
-        Direction::Encrypt => filter.encrypt(&key, data),
-        Direction::Decrypt => filter.decrypt(&key, data),
+/// Remove `Crypt` from an array filter chain after the payload has been
+/// decrypted, keeping the remaining filter/parameter pairs aligned.
+fn strip_crypt_filter(stream: &mut Stream) {
+    let Ok(filters) = stream.filters() else {
+        return;
+    };
+    let Some(index) = filters.iter().position(|filter| *filter == b"Crypt") else {
+        return;
+    };
+    if let Ok(Object::Array(names)) = stream.dict.get(b"Filter") {
+        let mut names = names.clone();
+        names.remove(index);
+        if names.is_empty() {
+            stream.dict.remove(b"Filter");
+            stream.dict.remove(b"DecodeParms");
+            return;
+        }
+        stream.dict.set(b"Filter", Object::Array(names));
+        if let Ok(Object::Array(mut params)) = stream.dict.get(b"DecodeParms").cloned() {
+            if index < params.len() {
+                params.remove(index);
+            }
+            if params.iter().all(|param| matches!(param, Object::Null)) {
+                stream.dict.remove(b"DecodeParms");
+            } else {
+                stream.dict.set(b"DecodeParms", Object::Array(params));
+            }
+        }
+    } else {
+        stream.dict.remove(b"Filter");
+        stream.dict.remove(b"DecodeParms");
     }
 }
 
 /// Encrypts `obj`.
-///
-/// Every string and stream is encrypted, including the strings in a stream dictionary, except
-/// the `/Contents` of a signature dictionary (ISO 32000-1, 7.6.2). That exemption only covers a
-/// string written in the dictionary itself: a `/Contents` held in an indirect object cannot be
-/// recognised here and is encrypted like any other object.
-///
-/// An object that cannot be fully encrypted is still encrypted as far as possible; the first
-/// error is returned.
-pub fn encrypt_object(state: &EncryptionState, obj_id: ObjectId, obj: &mut Object) -> Result<(), DecryptionError> {
+pub fn encrypt_object(
+    state: &EncryptionState,
+    obj_id: ObjectId,
+    obj: &mut Object,
+) -> Result<(), DecryptionError> {
     transform_object(state, obj_id, obj, Direction::Encrypt)
 }
 
-/// Decrypts `obj`, with the same coverage and exemptions as [`encrypt_object`].
-///
-/// An object that cannot be fully decrypted is still decrypted as far as possible; the first
-/// error is returned.
-pub fn decrypt_object(state: &EncryptionState, obj_id: ObjectId, obj: &mut Object) -> Result<(), DecryptionError> {
+/// Decrypts `obj`.
+pub fn decrypt_object(
+    state: &EncryptionState,
+    obj_id: ObjectId,
+    obj: &mut Object,
+) -> Result<(), DecryptionError> {
     transform_object(state, obj_id, obj, Direction::Decrypt)
 }
 
@@ -1011,105 +1077,10 @@ mod tests {
     use super::rc4::Rc4;
     use crate::creator::tests::create_document;
     use crate::encryption::{Aes128CryptFilter, Aes256CryptFilter, CryptFilter};
-    use crate::{EncryptionState, EncryptionVersion, Object, Permissions};
+    use crate::{EncryptionState, EncryptionVersion, Permissions};
     use rand::RngExt as _;
     use std::collections::BTreeMap;
     use std::sync::Arc;
-
-    /// Asserts that `debug` holds neither password nor a byte run of the key `[0xAB; 32]`, in
-    /// either the `{:?}` or the `{:#?}` layout.
-    fn assert_no_secrets(debug: &str) {
-        assert!(!debug.contains("owner-secret"), "{debug}");
-        assert!(!debug.contains("user-secret"), "{debug}");
-        let compact: String = debug.split_whitespace().collect();
-        assert!(!compact.contains("171,171,171,171"), "{debug}");
-    }
-
-    #[test]
-    #[allow(deprecated)]
-    fn debug_hides_the_passwords_and_the_file_encryption_key() {
-        let document = create_document();
-        let file_encryption_key = [0xABu8; 32];
-        let aes128: Arc<dyn CryptFilter> = Arc::new(Aes128CryptFilter);
-        let aes256: Arc<dyn CryptFilter> = Arc::new(Aes256CryptFilter);
-        let versions = [
-            EncryptionVersion::V1 {
-                document: &document,
-                owner_password: "owner-secret",
-                user_password: "user-secret",
-                permissions: Permissions::all(),
-            },
-            EncryptionVersion::V2 {
-                document: &document,
-                owner_password: "owner-secret",
-                user_password: "user-secret",
-                key_length: 128,
-                permissions: Permissions::all(),
-            },
-            EncryptionVersion::V4 {
-                document: &document,
-                encrypt_metadata: true,
-                crypt_filters: BTreeMap::from([(b"StdCF".to_vec(), aes128)]),
-                stream_filter: b"StdCF".to_vec(),
-                string_filter: b"StdCF".to_vec(),
-                owner_password: "owner-secret",
-                user_password: "user-secret",
-                permissions: Permissions::all(),
-            },
-            EncryptionVersion::R5 {
-                encrypt_metadata: true,
-                crypt_filters: BTreeMap::from([(b"StdCF".to_vec(), aes256.clone())]),
-                file_encryption_key: &file_encryption_key,
-                stream_filter: b"StdCF".to_vec(),
-                string_filter: b"StdCF".to_vec(),
-                owner_password: "owner-secret",
-                user_password: "user-secret",
-                permissions: Permissions::all(),
-            },
-            EncryptionVersion::V5 {
-                encrypt_metadata: true,
-                crypt_filters: BTreeMap::from([(b"StdCF".to_vec(), aes256)]),
-                file_encryption_key: &file_encryption_key,
-                stream_filter: b"StdCF".to_vec(),
-                string_filter: b"StdCF".to_vec(),
-                owner_password: "owner-secret",
-                user_password: "user-secret",
-                permissions: Permissions::all(),
-            },
-        ];
-        for version in &versions {
-            let has_key = matches!(version, EncryptionVersion::R5 { .. } | EncryptionVersion::V5 { .. });
-            for debug in [format!("{version:?}"), format!("{version:#?}")] {
-                assert_no_secrets(&debug);
-                assert!(debug.contains("owner_password: \"***\""), "{debug}");
-                assert!(debug.contains("user_password: \"***\""), "{debug}");
-                assert_eq!(debug.contains("file_encryption_key: \"***\""), has_key, "{debug}");
-                assert!(debug.contains("permissions: "), "{debug}");
-            }
-        }
-
-        // The state hides the key, but still prints /O and /U, which the file holds anyway.
-        let [.., v5] = versions;
-        let state = EncryptionState::try_from(v5).unwrap();
-        let owner_value = format!("owner_value: {:?}", state.owner_value());
-        for debug in [format!("{state:?}"), format!("{state:#?}")] {
-            assert_no_secrets(&debug);
-            assert!(debug.contains("file_encryption_key: \"***\""), "{debug}");
-            assert!(debug.contains("revision: 6"), "{debug}");
-        }
-        assert!(format!("{state:?}").contains(&owner_value));
-
-        // A decrypted document holds the state, and so prints it too.
-        let mut document = create_document();
-        document.encrypt(&state).unwrap();
-        document.decrypt("user-secret").unwrap();
-        let decrypted_state = document.encryption_state.as_ref().unwrap();
-        assert_eq!(decrypted_state.file_encryption_key(), file_encryption_key);
-        for debug in [format!("{document:?}"), format!("{document:#?}")] {
-            assert_no_secrets(&debug);
-            assert!(debug.contains("file_encryption_key: \"***\""), "{debug}");
-        }
-    }
 
     #[test]
     fn rc4_works() {
@@ -1120,7 +1091,11 @@ mod tests {
                 String::from("Plaintext"),
                 String::from("BBF316E8D940AF0AD3"),
             ),
-            (String::from("Wiki"), String::from("pedia"), String::from("1021BF0420")),
+            (
+                String::from("Wiki"),
+                String::from("pedia"),
+                String::from("1021BF0420"),
+            ),
         ];
 
         for (key, plain, cipher) in cases {
@@ -1128,7 +1103,8 @@ mod tests {
             let cipher = cipher.as_bytes();
             let mut cipher_bytes = Vec::with_capacity(cipher.len() / 2);
             for hex_pair in cipher.as_chunks::<2>().0 {
-                cipher_bytes.push(u8::from_str_radix(std::str::from_utf8(hex_pair).unwrap(), 16).unwrap());
+                cipher_bytes
+                    .push(u8::from_str_radix(std::str::from_utf8(hex_pair).unwrap(), 16).unwrap());
             }
 
             let decryptor = Rc4::new(key);
@@ -1143,7 +1119,8 @@ mod tests {
     #[test]
     fn encrypt_and_decrypt_every_revision() {
         let document = create_document();
-        let crypt_filters = |filter: Arc<dyn CryptFilter>| BTreeMap::from([(b"StdCF".to_vec(), filter)]);
+        let crypt_filters =
+            |filter: Arc<dyn CryptFilter>| BTreeMap::from([(b"StdCF".to_vec(), filter)]);
 
         let mut file_encryption_key = [0u8; 32];
         rand::rng().fill(&mut file_encryption_key);
@@ -1203,60 +1180,6 @@ mod tests {
         }
     }
 
-    /// A V 5 encryption dictionary names its key lengths: /Length 256 in /Encrypt and
-    /// /Length 32 in the AESV3 crypt filter. LibreOffice shows blank pages without them.
-    #[test]
-    fn encode_v5_writes_key_lengths() {
-        let document = create_document();
-        let crypt_filters = |filter: Arc<dyn CryptFilter>| BTreeMap::from([(b"StdCF".to_vec(), filter)]);
-        let file_encryption_key = [7u8; 32];
-
-        let v5 = EncryptionState::try_from(EncryptionVersion::V5 {
-            encrypt_metadata: true,
-            crypt_filters: crypt_filters(Arc::new(Aes256CryptFilter)),
-            file_encryption_key: &file_encryption_key,
-            stream_filter: b"StdCF".to_vec(),
-            string_filter: b"StdCF".to_vec(),
-            owner_password: "owner",
-            user_password: "user",
-            permissions: Permissions::all(),
-        })
-        .unwrap()
-        .encode()
-        .unwrap();
-        assert_eq!(v5.get(b"Length").and_then(Object::as_i64).ok(), Some(256));
-        let std_cf = v5
-            .get(b"CF")
-            .and_then(Object::as_dict)
-            .and_then(|cf| cf.get(b"StdCF"))
-            .and_then(Object::as_dict)
-            .unwrap();
-        assert_eq!(std_cf.get(b"Length").and_then(Object::as_i64).ok(), Some(32));
-
-        // V 4 keeps what it wrote before: /Length 128, and none in an AESV2 filter.
-        let v4 = EncryptionState::try_from(EncryptionVersion::V4 {
-            document: &document,
-            encrypt_metadata: true,
-            crypt_filters: crypt_filters(Arc::new(Aes128CryptFilter)),
-            stream_filter: b"StdCF".to_vec(),
-            string_filter: b"StdCF".to_vec(),
-            owner_password: "owner",
-            user_password: "user",
-            permissions: Permissions::all(),
-        })
-        .unwrap()
-        .encode()
-        .unwrap();
-        assert_eq!(v4.get(b"Length").and_then(Object::as_i64).ok(), Some(128));
-        let std_cf = v4
-            .get(b"CF")
-            .and_then(Object::as_dict)
-            .and_then(|cf| cf.get(b"StdCF"))
-            .and_then(Object::as_dict)
-            .unwrap();
-        assert!(std_cf.get(b"Length").is_err());
-    }
-
     #[test]
     fn decrypt_v4_without_length() {
         let mut document = create_document();
@@ -1279,7 +1202,12 @@ mod tests {
 
         // Length is optional for V4, which fixes the file encryption key at 128
         // bits, and plenty of producers leave the entry out.
-        let encrypt_id = document.trailer.get(b"Encrypt").unwrap().as_reference().unwrap();
+        let encrypt_id = document
+            .trailer
+            .get(b"Encrypt")
+            .unwrap()
+            .as_reference()
+            .unwrap();
         document
             .get_object_mut(encrypt_id)
             .unwrap()

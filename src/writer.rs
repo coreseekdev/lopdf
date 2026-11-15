@@ -13,37 +13,25 @@ impl Document {
     #[inline]
     pub fn save<P: AsRef<Path>>(&mut self, path: P) -> Result<File> {
         let mut file = BufWriter::new(File::create(path)?);
-        self.save_internal(&mut file, Style::default())?;
+        self.save_internal(&mut file)?;
         Ok(file.into_inner()?)
     }
 
     /// Save PDF to arbitrary target
     #[inline]
     pub fn save_to<W: Write>(&mut self, target: &mut W) -> Result<()> {
-        self.save_internal(target, Style::default())
+        self.save_internal(target)
     }
 
     /// Save PDF with custom options
     ///
     /// Object streams are skipped for an encrypted document, which is written with every
     /// object serialized individually instead. See [`Document::save_modern`].
-    ///
-    /// # Errors
-    ///
-    /// Fails with [`std::io::ErrorKind::InvalidInput`] when [`SaveOptions::ascii`](crate::SaveOptions::ascii)
-    /// is set for an encrypted document, before anything is written.
-    pub fn save_with_options<W: Write>(&mut self, target: &mut W, options: crate::SaveOptions) -> Result<()> {
-        // A reader decrypts a stream's data before it applies the stream's filters, so an
-        // `/ASCIIHexDecode` filter would have to be applied before encryption, which turns
-        // the data back into binary ciphertext.
-        if options.ascii && self.is_encrypted() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "an encrypted document cannot be saved as ASCII: its streams are decrypted before their filters apply",
-            ));
-        }
-        let style = Style::new(&options);
-
+    pub fn save_with_options<W: Write>(
+        &mut self,
+        target: &mut W,
+        options: crate::SaveOptions,
+    ) -> Result<()> {
         // Xref streams and object streams are independent; select the requested type here so it
         // applies to whichever path writes the body. Both arrived in PDF 1.5, so bump the version.
         if options.use_xref_streams {
@@ -55,9 +43,9 @@ impl Document {
         }
 
         if options.use_object_streams {
-            self.save_with_object_streams(target, options, style)
+            self.save_with_object_streams(target, options)
         } else {
-            self.save_internal(target, style)
+            self.save_internal(target)
         }
     }
 
@@ -85,79 +73,44 @@ impl Document {
         matches!(object.type_name(), Ok(name) if name == b"ObjStm" || name == b"XRef" || name == b"Linearized")
     }
 
-    fn save_internal<W: Write>(&mut self, target: &mut W, style: Style) -> Result<()> {
-        // A plain save uses the document's existing xref format, including the default stream.
-        if matches!(
-            self.reference_table.cross_reference_type,
-            XrefType::CrossReferenceStream
-        ) && self.version.as_str() < "1.5"
-        {
-            self.version = "1.5".to_string();
-        }
+    fn save_internal<W: Write>(&mut self, target: &mut W) -> Result<()> {
         let mut target = CountingWrite {
             inner: target,
             bytes_written: 0,
         };
 
-        let mut xref = Xref::new(self.max_id.saturating_add(1), self.reference_table.cross_reference_type);
-        self.write_header(&mut target, style)?;
+        let mut xref = Xref::new(self.max_id + 1, self.reference_table.cross_reference_type);
+        writeln!(target, "%PDF-{}", self.version)?;
+
+        Writer::write_binary_mark(&mut target, &self.binary_mark)?;
 
         for (&(id, generation), object) in &self.objects {
             if !Self::is_regenerated_on_save(object) {
-                Writer::write_indirect_object(&mut target, id, generation, object, &mut xref, style)?;
+                Writer::write_indirect_object(&mut target, id, generation, object, &mut xref)?;
             }
         }
 
         let xref_start = target.bytes_written;
-        Self::write_xref_and_trailer(
-            &mut target,
-            &mut xref,
-            xref_start,
-            self.trailer.clone(),
-            self.max_id,
-            style,
-        )
-    }
-
-    /// Write the `%PDF-x.y` line and, unless the output is to be ASCII, the binary mark.
-    fn write_header(&self, target: &mut dyn Write, style: Style) -> Result<()> {
-        writeln!(target, "%PDF-{}", self.version)?;
-        if style.ascii {
-            Ok(())
-        } else {
-            Writer::write_binary_mark(target, &self.binary_mark)
-        }
-    }
-
-    /// The number after `last_id`, for an object the writer generates: an object stream or the
-    /// cross-reference stream. These are numbered after [`Document::max_id`] without raising it,
-    /// so saving a document does not change it and saving it again writes the same file.
-    fn next_generated_id(last_id: &mut u32) -> Result<u32> {
-        *last_id = last_id
-            .checked_add(1)
-            .ok_or_else(|| std::io::Error::other(crate::Error::ObjectIdOverflow))?;
-        Ok(*last_id)
+        self.write_xref_and_trailer(&mut target, &mut xref, xref_start)
     }
 
     /// Write the cross-reference data in the requested form, then the
     /// `startxref` pointer that closes the file.
-    ///
-    /// `trailer` is a copy of the document's trailer that the writer completes with `/Size` and,
-    /// for a cross-reference stream, the stream's own entries, so the document's trailer stays as
-    /// it was. `last_id` is the highest object number written so far.
     fn write_xref_and_trailer<W: Write>(
-        target: &mut CountingWrite<&mut W>, xref: &mut Xref, xref_start: usize, trailer: Dictionary, last_id: u32,
-        style: Style,
+        &mut self,
+        target: &mut CountingWrite<&mut W>,
+        xref: &mut Xref,
+        xref_start: usize,
     ) -> Result<()> {
         // Pick right cross reference stream.
         match xref.cross_reference_type {
             XrefType::CrossReferenceTable => {
                 Writer::write_xref(target, xref)?;
-                Self::write_trailer(target, trailer, last_id, style)?;
+                self.write_trailer(target)?;
             }
             XrefType::CrossReferenceStream => {
                 // Cross Reference Stream instead of XRef and Trailer
-                Self::write_cross_reference_stream(target, xref, xref_start as u32, trailer, last_id, style)?;
+                self.write_cross_reference_stream(target, xref, xref_start as u32)?;
             }
         }
         // Write `startxref` part of trailer
@@ -166,7 +119,9 @@ impl Document {
 
     /// Save PDF with object streams enabled
     fn save_with_object_streams<W: Write>(
-        &mut self, target: &mut W, options: crate::SaveOptions, style: Style,
+        &mut self,
+        target: &mut W,
+        options: crate::SaveOptions,
     ) -> Result<()> {
         use crate::ObjectStream;
         use std::collections::HashMap;
@@ -180,7 +135,7 @@ impl Document {
         // and the strings packed inside are themselves already encrypted (an object stream is the
         // unit of encryption). Write the objects out individually instead, as `save` does.
         if self.is_encrypted() {
-            return self.save_internal(target, style);
+            return self.save_internal(target);
         }
 
         let mut target = CountingWrite {
@@ -188,8 +143,9 @@ impl Document {
             bytes_written: 0,
         };
 
-        let mut xref = Xref::new(self.max_id.saturating_add(1), self.reference_table.cross_reference_type);
-        self.write_header(&mut target, style)?;
+        let mut xref = Xref::new(self.max_id + 1, self.reference_table.cross_reference_type);
+        writeln!(target, "%PDF-{}", self.version)?;
+        Writer::write_binary_mark(&mut target, &self.binary_mark)?;
 
         // Organize objects into streams
         let mut object_streams: Vec<crate::ObjectStream> = Vec::new();
@@ -237,15 +193,15 @@ impl Document {
 
         // Write direct objects first
         for ((id, generation), object) in objects_to_write_directly {
-            Writer::write_indirect_object(&mut target, id, generation, object, &mut xref, style)?;
+            Writer::write_indirect_object(&mut target, id, generation, object, &mut xref)?;
         }
 
         // Write object streams
-        let mut last_id = self.max_id;
+        let mut stream_count = 0;
         for obj_stream in object_streams.into_iter() {
-            let stream_id = Self::next_generated_id(&mut last_id)?;
+            let stream_id = self.max_id + 1 + stream_count;
             let stream_obj = obj_stream
-                .to_styled_stream_object(style)
+                .to_stream_object()
                 .map_err(std::io::Error::other)?;
 
             // Record compressed objects in xref. The index must match the order
@@ -261,11 +217,21 @@ impl Document {
             }
 
             // Write the object stream
-            Writer::write_indirect_object(&mut target, stream_id, 0, &Object::Stream(stream_obj), &mut xref, style)?;
+            Writer::write_indirect_object(
+                &mut target,
+                stream_id,
+                0,
+                &Object::Stream(stream_obj),
+                &mut xref,
+            )?;
+            stream_count += 1;
         }
 
+        // Update max_id to account for object streams
+        self.max_id += stream_count;
+
         let xref_start = target.bytes_written;
-        Self::write_xref_and_trailer(&mut target, &mut xref, xref_start, self.trailer.clone(), last_id, style)
+        self.write_xref_and_trailer(&mut target, &mut xref, xref_start)
     }
 
     /// Write the Cross Reference Stream.
@@ -273,10 +239,14 @@ impl Document {
     /// Insert an `Object` to the end of the PDF (not visible when inspecting `Document`).
     /// Note: This is different from the "Cross Reference Table".
     fn write_cross_reference_stream<W: Write>(
-        file: &mut CountingWrite<&mut W>, xref: &mut Xref, xref_start: u32, mut trailer: Dictionary, mut last_id: u32,
-        style: Style,
+        &mut self,
+        file: &mut CountingWrite<&mut W>,
+        xref: &mut Xref,
+        xref_start: u32,
     ) -> Result<()> {
-        let new_obj_id_for_crs = Self::next_generated_id(&mut last_id)?;
+        // Increment max_id to account for CRS.
+        self.max_id += 1;
+        let new_obj_id_for_crs = self.max_id;
         xref.insert(
             new_obj_id_for_crs,
             XrefEntry::Normal {
@@ -284,44 +254,44 @@ impl Document {
                 generation: 0,
             },
         );
-        trailer.set("Type", Name(b"XRef".to_vec()));
-        // The cross-reference stream is the highest object number.
-        trailer.set("Size", i64::from(last_id) + 1);
+        self.trailer.set("Type", Name(b"XRef".to_vec().into()));
+        // Update `max_id` in trailer
+        self.trailer.set("Size", i64::from(self.max_id + 1));
         // `[u8, u32, u16]` per entry (the PDF default is `[1 2 1]`).
-        trailer.set("W", Array(vec![Integer(1), Integer(4), Integer(2)]));
-        let filter = if style.ascii {
-            XRefStreamFilter::ASCIIHexDecode
-        } else {
-            XRefStreamFilter::None
-        };
+        self.trailer
+            .set("W", Array(vec![Integer(1), Integer(4), Integer(2)]));
+        // Note that `ASCIIHexDecode` does not work correctly,
+        // but is still useful for debugging sometimes.
+        let filter = XRefStreamFilter::None;
         let (stream, stream_length, indexes) = Writer::create_xref_steam(xref, filter)?;
-        trailer.set("Index", indexes);
+        self.trailer.set("Index", indexes);
 
         if filter == XRefStreamFilter::ASCIIHexDecode {
-            trailer.set("Filter", Name(b"ASCIIHexDecode".to_vec()));
+            self.trailer.set("Filter", Name(b"ASCIIHexDecode".to_vec().into()));
         } else {
-            trailer.remove(b"Filter");
+            self.trailer.remove(b"Filter");
         }
 
-        trailer.set("Length", stream_length as i64);
+        self.trailer.set("Length", stream_length as i64);
 
+        let trailer = &self.trailer;
         let cross_reference_stream = Stream(Stream {
-            dict: trailer,
+            dict: trailer.clone(),
             allows_compression: true,
             content: stream,
             start_position: None,
         });
         // Insert Cross Reference Stream as an `Object` to the end of the PDF.
         // The `Object` is not added to `Document` because it is generated every time you save.
-        Writer::write_indirect_object(file, new_obj_id_for_crs, 0, &cross_reference_stream, xref, style)?;
+        Writer::write_indirect_object(file, new_obj_id_for_crs, 0, &cross_reference_stream, xref)?;
 
         Ok(())
     }
 
-    fn write_trailer(file: &mut dyn Write, mut trailer: Dictionary, last_id: u32, style: Style) -> Result<()> {
-        trailer.set("Size", i64::from(last_id) + 1);
+    fn write_trailer(&mut self, file: &mut dyn Write) -> Result<()> {
+        self.trailer.set("Size", i64::from(self.max_id + 1));
         file.write_all(b"trailer\n")?;
-        Writer::write_dictionary(file, &trailer, style)?;
+        Writer::write_dictionary(file, &self.trailer)?;
         Ok(())
     }
 }
@@ -346,11 +316,13 @@ impl IncrementalDocument {
         self.save_internal(target)
     }
 
-    /// Reject the two cases we still cannot handle: a document that arrived
-    /// still-encrypted (no password was supplied), and the inconsistent case
-    /// of `encryption_state` set but `encrypt_object_id` missing (which should
+    /// Reject the cases we still cannot handle: a document that arrived
+    /// still-encrypted (no password was supplied), the inconsistent case of
+    /// `encryption_state` set but `encrypt_object_id` missing (which should
     /// not occur in practice — `decrypt_raw` records the id — but we guard
-    /// against it defensively).
+    /// against it defensively), and a previous revision whose cross-reference
+    /// table was rebuilt by scanning.  The last has no xref section to point
+    /// `/Prev` at, so appending would silently drop every unchanged object.
     fn check_incremental_save_supported(&self) -> Result<()> {
         let prev = self.get_prev_documents();
         if prev.is_encrypted() {
@@ -370,6 +342,14 @@ impl IncrementalDocument {
                  the /Encrypt object id was not recorded during decryption",
             ));
         }
+        if prev.xref_start == 0 && !self.get_prev_documents_bytes().is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "incremental update of a PDF with a reconstructed cross-reference \
+                 table is not supported: there is no previous xref section for /Prev, \
+                 so the append would not resolve unchanged objects (use a full save)",
+            ));
+        }
         Ok(())
     }
 
@@ -385,16 +365,35 @@ impl IncrementalDocument {
             bytes_written: 0,
         };
 
-        // Write previous document versions.
+        // Write previous document versions.  The appended cross-reference
+        // section is counted from the `%PDF-` header, not from the physical
+        // start of the file: readers keep parser positions header-relative
+        // when a file has junk before the header (pdfium
+        // `fpdf_parser_utility.cpp:79-94`, `cpdf_syntax_parser.cpp:133`;
+        // pdf.js `document.js:1161-1170` moves the stream start and
+        // `xref.js:753` adds it to every `startxref`).  Counting the junk
+        // prefix would make the new `startxref` and every appended object
+        // offset point `header_offset` bytes too far.
         let prev_document_bytes = self.get_prev_documents_bytes();
         target.inner.write_all(prev_document_bytes)?;
-        target.bytes_written += prev_document_bytes.len();
+        target.bytes_written = prev_document_bytes.len() - header_offset(prev_document_bytes);
 
         // Write/Append new document version.
         let mut xref = Xref::new(
-            self.new_document.max_id.saturating_add(1),
-            self.get_prev_documents().reference_table.cross_reference_type,
+            self.new_document.max_id + 1,
+            self.get_prev_documents()
+                .reference_table
+                .cross_reference_type,
         );
+        // Removed objects become free entries with generation + 1 so the new
+        // revision cannot resolve them through /Prev.
+        for id in self.deleted_objects() {
+            let generation = match self.get_prev_documents().reference_table.get(id.0) {
+                Some(XrefEntry::Normal { generation, .. }) => generation.saturating_add(1),
+                _ => 1,
+            };
+            xref.insert(id.0, XrefEntry::Free { generation });
+        }
 
         if let Some(last_byte) = prev_document_bytes.last()
             && *last_byte != b'\n'
@@ -416,43 +415,43 @@ impl IncrementalDocument {
             }
             if let Some(state) = encryption_state.as_ref() {
                 let mut encrypted = object.clone();
-                encryption::encrypt_object(state, (id, generation), &mut encrypted).map_err(std::io::Error::other)?;
-                Writer::write_indirect_object(&mut target, id, generation, &encrypted, &mut xref, Style::default())?;
+                encryption::encrypt_object(state, (id, generation), &mut encrypted)
+                    .map_err(std::io::Error::other)?;
+                Writer::write_indirect_object(&mut target, id, generation, &encrypted, &mut xref)?;
             } else {
-                Writer::write_indirect_object(&mut target, id, generation, object, &mut xref, Style::default())?;
+                Writer::write_indirect_object(&mut target, id, generation, object, &mut xref)?;
             }
         }
 
-        // Write a trailer copy carrying the /Encrypt reference, so `new_document.trailer` stays
-        // clean for later saves.
-        let mut trailer = self.new_document.trailer.clone();
-        if let Some(state) = encryption_state.as_ref() {
+        // Swap in a trailer copy carrying the /Encrypt reference, so the writers that mutate
+        // Size/W/Length see it; swap back so `new_document.trailer` stays clean for later saves.
+        let saved_trailer = if let Some(state) = encryption_state.as_ref() {
             let encrypt_id = state
                 .encrypt_object_id()
                 .expect("encrypt_object_id presence checked by check_incremental_save_supported");
-            trailer.set(b"Encrypt", Object::Reference(encrypt_id));
-        }
+            let mut modified = self.new_document.trailer.clone();
+            modified.set(b"Encrypt", Object::Reference(encrypt_id));
+            Some(std::mem::replace(&mut self.new_document.trailer, modified))
+        } else {
+            None
+        };
 
         let xref_start = target.bytes_written;
 
         // Pick right cross reference stream.
-        Document::write_xref_and_trailer(
-            &mut target,
-            &mut xref,
-            xref_start,
-            trailer,
-            self.new_document.max_id,
-            Style::default(),
-        )
+        let write_result =
+            self.new_document
+                .write_xref_and_trailer(&mut target, &mut xref, xref_start);
+
+        // Restore the original in-memory trailer even if writing failed.
+        if let Some(saved) = saved_trailer {
+            self.new_document.trailer = saved;
+        }
+
+        write_result
     }
 }
 
-/// Low-level PDF object serializer.
-///
-/// Exposed so that callers which write a document incrementally (reserving
-/// object ids up front and emitting the body as it is produced) can serialize
-/// individual objects with exactly the same bytes `Document::save` would
-/// produce, instead of reimplementing the format.
 pub struct Writer;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -463,24 +462,14 @@ pub enum XRefStreamFilter {
 }
 
 impl Writer {
-    /// Whether a blank must precede this object when it directly follows
-    /// another token (a dictionary key, an array element, or the
-    /// `N G obj` header of an indirect object).
-    ///
-    /// Exposed for incremental writers (see [`Writer`]): framing an indirect
-    /// object as `N G obj` + object + `endobj` requires the same separator
-    /// decision `Document::save` makes internally, and reimplementing it
-    /// downstream is how the two serializers drift apart. Pair with
-    /// [`Self::need_end_separator`] for the trailing side.
-    pub fn need_separator(object: &Object) -> bool {
-        matches!(*object, Null | Boolean(_) | Integer(_) | Real(_) | Reference(_))
+    fn need_separator(object: &Object) -> bool {
+        matches!(
+            *object,
+            Null | Boolean(_) | Integer(_) | Real(_) | Reference(_)
+        )
     }
 
-    /// Whether a blank must follow this object before the next token (for
-    /// example before `endobj` when framing an indirect object).
-    ///
-    /// Exposed for incremental writers; see [`Self::need_separator`].
-    pub fn need_end_separator(object: &Object) -> bool {
+    fn need_end_separator(object: &Object) -> bool {
         matches!(
             *object,
             Null | Boolean(_) | Integer(_) | Real(_) | Name(_) | Reference(_) | Object::Stream(_)
@@ -490,27 +479,33 @@ impl Writer {
     /// Group the table's entries into the contiguous runs a cross-reference
     /// table or stream is built from.
     ///
-    /// Walk the entries, not every number up to the highest, so that a high
-    /// object number does not make saving slow. A section starts at a
-    /// *present* id; starting it at a missing id would shift every subsequent
-    /// entry by one. Object 0 is left out; only a table has to invent an entry
-    /// for it, and [`Self::write_xref`] is where that happens.
+    /// Iterate to the actual highest entry: `xref.size` is fixed before object
+    /// streams and the xref stream itself are appended, so entries past it
+    /// would never reach the output. A section starts at the first *present*
+    /// id; starting it at a missing id would shift every subsequent entry by
+    /// one. Object 0 is left out; only a table has to invent an entry for it,
+    /// and [`Self::write_xref`] is where that happens.
     fn xref_sections(xref: &Xref) -> Vec<XrefSection> {
-        let mut sections: Vec<XrefSection> = Vec::new();
+        let mut sections = Vec::new();
+        let mut current = XrefSection::new(0);
 
-        for (&obj_id, entry) in xref.entries.range(1..) {
-            match sections.last_mut() {
-                // No number is missing between the section and this entry. The sum cannot
-                // overflow: it is at most `obj_id`.
-                Some(section) if section.starting_id + section.entries.len() as u32 == obj_id => {
-                    section.add_entry(entry.clone());
+        for obj_id in 1..=xref.max_id() {
+            if let Some(entry) = xref.get(obj_id) {
+                if current.is_empty() {
+                    current = XrefSection::new(obj_id);
                 }
-                _ => {
-                    let mut section = XrefSection::new(obj_id);
-                    section.add_entry(entry.clone());
-                    sections.push(section);
+                current.add_entry(entry.clone());
+            } else {
+                // Skip over the gap, but close the section first if one is open.
+                if !current.is_empty() {
+                    sections.push(current);
+                    current = XrefSection::new(0);
                 }
             }
+        }
+
+        if !current.is_empty() {
+            sections.push(current);
         }
 
         sections
@@ -530,7 +525,10 @@ impl Writer {
         // its own — appending it to a section that starts later would attribute
         // that section's first entry to object 1. A document with no objects at
         // all still needs the lone entry, which the `insert` covers.
-        if sections.first().is_some_and(|section| section.starting_id == 1) {
+        if sections
+            .first()
+            .is_some_and(|section| section.starting_id == 1)
+        {
             sections[0].starting_id = 0;
         } else {
             sections.insert(0, XrefSection::new(0));
@@ -548,7 +546,10 @@ impl Writer {
     }
 
     /// Create stream for Cross reference stream.
-    fn create_xref_steam(xref: &Xref, filter: XRefStreamFilter) -> Result<(Vec<u8>, usize, Object)> {
+    fn create_xref_steam(
+        xref: &Xref,
+        filter: XRefStreamFilter,
+    ) -> Result<(Vec<u8>, usize, Object)> {
         let mut xref_stream = Vec::new();
         let mut xref_index = Vec::new();
 
@@ -556,14 +557,14 @@ impl Writer {
             // Add indexes to list
             xref_index.push(Integer(section.starting_id as i64));
             xref_index.push(Integer(section.entries.len() as i64));
-            // Add entries to stream. A `starting_id..` range would overflow on reaching `u32::MAX`.
-            for (obj_id, entry) in (section.starting_id..=u32::MAX).zip(section.entries) {
+            // Add entries to stream
+            for (obj_id, entry) in (section.starting_id..).zip(section.entries) {
                 match entry {
-                    XrefEntry::Free => {
+                    XrefEntry::Free { generation } => {
                         // Type 0
                         xref_stream.push(0);
                         xref_stream.extend(obj_id.to_be_bytes());
-                        xref_stream.extend(vec![0, 0]); // TODO add generation number
+                        xref_stream.extend(generation.to_be_bytes());
                     }
                     XrefEntry::UnusableFree => {
                         // Type 0
@@ -587,19 +588,25 @@ impl Writer {
             }
         }
 
-        if filter == XRefStreamFilter::ASCIIHexDecode {
-            xref_stream = Writer::ascii_hex(&xref_stream);
-        }
-
-        // `/Length` counts the bytes that are stored, after any encoding, and not the end of
-        // line that is written before `endstream`.
+        // The end of line character should not be counted, added later.
         let stream_length = xref_stream.len();
+
+        if filter == XRefStreamFilter::ASCIIHexDecode {
+            xref_stream = xref_stream
+                .iter()
+                .flat_map(|c| format!("{c:02X}").as_bytes().to_vec())
+                .collect::<Vec<u8>>();
+        }
 
         Ok((xref_stream, stream_length, Array(xref_index)))
     }
 
     fn write_indirect_object<W: Write>(
-        file: &mut CountingWrite<&mut W>, id: u32, generation: u16, object: &Object, xref: &mut Xref, style: Style,
+        file: &mut CountingWrite<&mut W>,
+        id: u32,
+        generation: u16,
+        object: &Object,
+        xref: &mut Xref,
     ) -> Result<()> {
         let offset = file.bytes_written as u32;
         xref.insert(id, XrefEntry::Normal { offset, generation });
@@ -608,32 +615,26 @@ impl Writer {
             "{} {} obj\n{}",
             id,
             generation,
-            if Writer::need_separator(object) { " " } else { "" }
+            if Writer::need_separator(object) {
+                " "
+            } else {
+                ""
+            }
         )?;
-        Writer::write_styled_object(file, object, style)?;
+        Writer::write_object(file, object)?;
         writeln!(
             file,
             "{}\nendobj",
-            if Writer::need_end_separator(object) { " " } else { "" }
+            if Writer::need_end_separator(object) {
+                " "
+            } else {
+                ""
+            }
         )?;
         Ok(())
     }
 
-    /// Serialize one object body (no `N G obj` / `endobj` wrapper).
-    ///
-    /// The bytes are identical to what [`Document::save`] writes for the same
-    /// object, so a caller assembling a file by hand can mix this with its own
-    /// framing and still produce a byte-compatible document.
-    ///
-    /// # Errors
-    ///
-    /// Propagates I/O errors from `file`.
     pub fn write_object(file: &mut dyn Write, object: &Object) -> Result<()> {
-        Writer::write_styled_object(file, object, Style::default())
-    }
-
-    /// Serialize one object body in the layout that `style` asks for.
-    pub(crate) fn write_styled_object(file: &mut dyn Write, object: &Object, style: Style) -> Result<()> {
         match object {
             Null => file.write_all(b"null"),
             Boolean(value) => {
@@ -647,22 +648,12 @@ impl Writer {
                 let mut buf = itoa::Buffer::new();
                 file.write_all(buf.format(*value).as_bytes())
             }
-            // `Display` writes every digit and never an exponent, which PDF syntax does not have,
-            // but it drops the point of a whole number (`0` for `0.0`), which would read back as
-            // an integer. NaN and the infinities have no PDF spelling and are left as they print.
-            Real(value) => {
-                let text = value.to_string();
-                file.write_all(text.as_bytes())?;
-                if value.is_finite() && !text.contains('.') {
-                    file.write_all(b".0")?;
-                }
-                Ok(())
-            }
+            Real(value) => write!(file, "{value}"),
             Name(name) => Writer::write_name(file, name),
-            String(text, format) => Writer::write_string(file, text, format, style),
-            Array(array) => Writer::write_array(file, array, style),
-            Object::Dictionary(dict) => Writer::write_dictionary(file, dict, style),
-            Object::Stream(stream) => Writer::write_stream(file, stream, style),
+            String(text, format) => Writer::write_string(file, text, format),
+            Array(array) => Writer::write_array(file, array),
+            Object::Dictionary(dict) => Writer::write_dictionary(file, dict),
+            Object::Stream(stream) => Writer::write_stream(file, stream),
             Reference(id) => write!(file, "{} {} R", id.0, id.1),
         }
     }
@@ -681,14 +672,11 @@ impl Writer {
         Ok(())
     }
 
-    fn write_string(file: &mut dyn Write, text: &[u8], format: &StringFormat, style: Style) -> Result<()> {
+    fn write_string(file: &mut dyn Write, text: &[u8], format: &StringFormat) -> Result<()> {
         match *format {
             // In a literal string escape each backslash and unbalanced parenthesis, byte by
-            // byte, and escape CR/LF since an unescaped end-of-line marker reads as \n. ASCII
-            // output also writes every byte that is not ASCII text as an octal escape, which
-            // keeps the string literal.
+            // byte, and escape CR/LF since an unescaped end-of-line marker reads as \n.
             StringFormat::Literal => {
-                let octal = |byte: u8| style.ascii && !is_ascii_text(byte);
                 let mut escape_indice = Vec::new();
                 let mut parentheses = Vec::new();
                 for (index, &byte) in text.iter().enumerate() {
@@ -708,15 +696,11 @@ impl Writer {
                 escape_indice.append(&mut parentheses);
 
                 file.write_all(b"(")?;
-                if !escape_indice.is_empty() || text.iter().any(|&byte| octal(byte)) {
+                if !escape_indice.is_empty() {
                     for (index, &byte) in text.iter().enumerate() {
                         if escape_indice.contains(&index) {
                             file.write_all(b"\\")?;
                             file.write_all(&[if byte == b'\r' { b'r' } else { byte }])?;
-                        } else if octal(byte) {
-                            // Three digits, so that a digit that follows is not read as part
-                            // of the escape.
-                            write!(file, "\\{byte:03o}")?;
                         } else {
                             file.write_all(&[byte])?;
                         }
@@ -737,32 +721,7 @@ impl Writer {
         Ok(())
     }
 
-    fn write_array(file: &mut dyn Write, array: &[Object], style: Style) -> Result<()> {
-        if style.pretty {
-            // An array of numbers, names and the like, such as a `/MediaBox`, stays on one line.
-            if !array
-                .iter()
-                .any(|object| matches!(object, Array(_) | Object::Dictionary(_) | Object::Stream(_)))
-            {
-                file.write_all(b"[")?;
-                for (index, object) in array.iter().enumerate() {
-                    if index > 0 {
-                        file.write_all(b" ")?;
-                    }
-                    Writer::write_styled_object(file, object, style)?;
-                }
-                return file.write_all(b"]");
-            }
-            let inner = style.nested();
-            file.write_all(b"[\n")?;
-            for object in array {
-                inner.indent(file)?;
-                Writer::write_styled_object(file, object, inner)?;
-                file.write_all(b"\n")?;
-            }
-            style.indent(file)?;
-            return file.write_all(b"]");
-        }
+    fn write_array(file: &mut dyn Write, array: &[Object]) -> Result<()> {
         file.write_all(b"[")?;
         let mut first = true;
         for object in array {
@@ -771,104 +730,31 @@ impl Writer {
             } else if Writer::need_separator(object) {
                 file.write_all(b" ")?;
             }
-            Writer::write_styled_object(file, object, style)?;
+            Writer::write_object(file, object)?;
         }
         file.write_all(b"]")?;
         Ok(())
     }
 
-    fn write_dictionary(file: &mut dyn Write, dictionary: &Dictionary, style: Style) -> Result<()> {
-        if style.pretty && !dictionary.is_empty() {
-            let inner = style.nested();
-            file.write_all(b"<<\n")?;
-            for (key, value) in dictionary {
-                inner.indent(file)?;
-                Writer::write_name(file, key)?;
-                file.write_all(b" ")?;
-                Writer::write_styled_object(file, value, inner)?;
-                file.write_all(b"\n")?;
-            }
-            style.indent(file)?;
-            return file.write_all(b">>");
-        }
+    fn write_dictionary(file: &mut dyn Write, dictionary: &Dictionary) -> Result<()> {
         file.write_all(b"<<")?;
         for (key, value) in dictionary {
             Writer::write_name(file, key)?;
             if Writer::need_separator(value) {
                 file.write_all(b" ")?;
             }
-            Writer::write_styled_object(file, value, style)?;
+            Writer::write_object(file, value)?;
         }
         file.write_all(b">>")?;
         Ok(())
     }
 
-    fn write_stream(file: &mut dyn Write, stream: &Stream, style: Style) -> Result<()> {
-        let encoded;
-        let stream = if style.ascii && !stream.content.iter().all(|&byte| is_ascii_text(byte)) {
-            encoded = Writer::ascii_hex_stream(stream)?;
-            &encoded
-        } else {
-            stream
-        };
-        Writer::write_dictionary(file, &stream.dict, style)?;
-        file.write_all(if style.pretty { b"\nstream\n" } else { b"stream\n" })?;
+    fn write_stream(file: &mut dyn Write, stream: &Stream) -> Result<()> {
+        Writer::write_dictionary(file, &stream.dict)?;
+        file.write_all(b"stream\n")?;
         file.write_all(&stream.content)?;
         file.write_all(b"\nendstream")?;
         Ok(())
-    }
-
-    /// A copy of `stream` whose data is encoded with `/ASCIIHexDecode`, which is added in front
-    /// of its filters, so that a reader decodes it to the same data.
-    fn ascii_hex_stream(stream: &Stream) -> Result<Stream> {
-        let hex = Name(b"ASCIIHexDecode".to_vec());
-        let mut dict = stream.dict.clone();
-        let filter = match dict.get(b"Filter") {
-            Err(_) | Ok(Null) => hex,
-            Ok(Name(name)) => Array(vec![hex, Name(name.clone())]),
-            Ok(Array(filters)) => Array([hex].into_iter().chain(filters.iter().cloned()).collect()),
-            Ok(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "cannot add /ASCIIHexDecode to a stream whose /Filter is neither a name nor an array",
-                ));
-            }
-        };
-        // The new filter takes no parameters. The parameters of the stream's own filters move
-        // one place along, or into an array if a dictionary or a reference held them.
-        let params = match dict.get(b"DecodeParms") {
-            Ok(Array(params)) => Some(Array([Null].into_iter().chain(params.iter().cloned()).collect())),
-            Ok(params @ (Object::Dictionary(_) | Reference(_))) => Some(Array(vec![Null, params.clone()])),
-            _ => None,
-        };
-        dict.set("Filter", filter);
-        if let Some(params) = params {
-            dict.set("DecodeParms", params);
-        }
-        let content = Writer::ascii_hex(&stream.content);
-        dict.set("Length", content.len() as i64);
-        Ok(Stream {
-            dict,
-            content,
-            allows_compression: stream.allows_compression,
-            start_position: stream.start_position,
-        })
-    }
-
-    /// Encode `data` as `/ASCIIHexDecode` reads it: two hexadecimal digits per byte, 64 to a
-    /// line, and `>` at the end.
-    fn ascii_hex(data: &[u8]) -> Vec<u8> {
-        const DIGITS: &[u8; 16] = b"0123456789ABCDEF";
-        let mut encoded = Vec::with_capacity(data.len() * 2 + data.len() / 32 + 1);
-        for (index, &byte) in data.iter().enumerate() {
-            if index > 0 && index % 32 == 0 {
-                encoded.push(b'\n');
-            }
-            encoded.push(DIGITS[usize::from(byte >> 4)]);
-            encoded.push(DIGITS[usize::from(byte & 0x0F)]);
-        }
-        encoded.push(b'>');
-        encoded
     }
 
     /// Write Binary mark as follows: %{binary_mark[4]}\n -> %Çì¢ or Hex(%25 c3 87 c3 ac)
@@ -887,47 +773,6 @@ impl Writer {
             ));
         }
 
-        Ok(())
-    }
-}
-
-/// Whether `byte` may appear in ASCII output: tab, line feed, carriage return, or a printable
-/// character.
-fn is_ascii_text(byte: u8) -> bool {
-    matches!(byte, b'\t' | b'\n' | b'\r' | b' '..=b'~')
-}
-
-/// How the writer lays out what it writes: the [`SaveOptions::ascii`](crate::SaveOptions::ascii)
-/// and [`SaveOptions::pretty`](crate::SaveOptions::pretty) options, and how deeply pretty printing
-/// indents the object being written.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct Style {
-    ascii: bool,
-    pretty: bool,
-    depth: usize,
-}
-
-impl Style {
-    fn new(options: &crate::SaveOptions) -> Self {
-        Self {
-            ascii: options.ascii,
-            pretty: options.pretty,
-            depth: 0,
-        }
-    }
-
-    /// The style of an entry or element one level further in.
-    fn nested(self) -> Self {
-        Self {
-            depth: self.depth + 1,
-            ..self
-        }
-    }
-
-    fn indent(self, file: &mut dyn Write) -> Result<()> {
-        for _ in 0..self.depth {
-            file.write_all(b"  ")?;
-        }
         Ok(())
     }
 }
@@ -961,6 +806,17 @@ impl<W: Write> Write for CountingWrite<W> {
     }
 }
 
+/// Byte offset of the `%PDF-` header in a previous revision, or 0 when the
+/// bytes are empty or contain no header.  This is the base that cross-reference
+/// offsets are measured from; the reader strips the same prefix in
+/// `Reader::read` (`reader.rs`), matching pdfium and pdf.js.
+fn header_offset(bytes: &[u8]) -> usize {
+    bytes
+        .windows(5)
+        .position(|window| window == b"%PDF-")
+        .unwrap_or(0)
+}
+
 #[test]
 fn save_document() {
     let mut doc = Document::with_version("1.5");
@@ -968,8 +824,10 @@ fn save_document() {
     doc.objects.insert((2, 0), Boolean(true));
     doc.objects.insert((3, 0), Integer(3));
     doc.objects.insert((4, 0), Real(0.5));
-    doc.objects
-        .insert((5, 0), String("text((\r)".as_bytes().to_vec(), StringFormat::Literal));
+    doc.objects.insert(
+        (5, 0),
+        String("text((\r)".as_bytes().to_vec(), StringFormat::Literal),
+    );
     doc.objects.insert(
         (6, 0),
         String("text((\r)".as_bytes().to_vec(), StringFormat::Hexadecimal),
@@ -978,8 +836,10 @@ fn save_document() {
     doc.objects.insert((8, 0), Reference((1, 0)));
     doc.objects
         .insert((9, 2), Array(vec![Integer(1), Integer(2), Integer(3)]));
-    doc.objects
-        .insert((11, 0), Stream(Stream::new(Dictionary::new(), vec![0x41, 0x42, 0x43])));
+    doc.objects.insert(
+        (11, 0),
+        Stream(Stream::new(Dictionary::new(), vec![0x41, 0x42, 0x43])),
+    );
     let mut dict = Dictionary::new();
     dict.set("A", Null);
     dict.set("B", false);
@@ -997,21 +857,4 @@ fn save_document() {
     assert!(file_path.is_file());
     // Check if the file is above 400 bytes (should be about 610 bytes)
     assert!(file_path.metadata().unwrap().len() > 400);
-}
-
-#[test]
-fn separator_decisions_are_public_for_incremental_writers() {
-    // Token-like objects need a separating blank; self-delimiting objects
-    // (names, strings, arrays, dictionaries, streams) do not need one before
-    // them, but a name/reference/stream still needs one after it.
-    assert!(Writer::need_separator(&Null));
-    assert!(Writer::need_separator(&Integer(1)));
-    assert!(Writer::need_separator(&Reference((1, 0))));
-    assert!(!Writer::need_separator(&Name(b"Type".to_vec())));
-    assert!(!Writer::need_separator(&Array(vec![Integer(1)])));
-
-    assert!(Writer::need_end_separator(&Null));
-    assert!(Writer::need_end_separator(&Name(b"Type".to_vec())));
-    assert!(Writer::need_end_separator(&Reference((1, 0))));
-    assert!(!Writer::need_end_separator(&Array(vec![Integer(1)])));
 }

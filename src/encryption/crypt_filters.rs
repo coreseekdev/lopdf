@@ -2,6 +2,7 @@ use super::DecryptionError;
 use super::pkcs5::Pkcs5;
 use super::rc4::Rc4;
 use crate::ObjectId;
+use aes::cipher::block_padding::NoPadding;
 use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
 use md5::{Digest as _, Md5};
 use rand::RngExt as _;
@@ -67,15 +68,18 @@ impl CryptFilter for Rc4CryptFilter {
     }
 
     fn compute_key(&self, key: &[u8], obj_id: ObjectId) -> Result<Vec<u8>, DecryptionError> {
-        Ok(md5_object_key(&key_with_object_number(key, obj_id), key.len()))
+        Ok(md5_object_key(
+            &key_with_object_number(key, obj_id),
+            key.len(),
+        ))
     }
 
     fn encrypt(&self, key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, DecryptionError> {
-        Ok(Rc4::new(key).encrypt(plaintext))
+        Ok(with_cached_rc4(key, |rc4| rc4.encrypt(plaintext)))
     }
 
     fn decrypt(&self, key: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, DecryptionError> {
-        Ok(Rc4::new(key).decrypt(ciphertext))
+        Ok(with_cached_rc4(key, |rc4| rc4.decrypt(ciphertext)))
     }
 }
 
@@ -94,12 +98,18 @@ macro_rules! aes_cbc_crypt_filter {
                 $method
             }
 
-            fn compute_key(&self, key: &[u8], obj_id: ObjectId) -> Result<Vec<u8>, DecryptionError> {
+            fn compute_key(
+                &self,
+                key: &[u8],
+                obj_id: ObjectId,
+            ) -> Result<Vec<u8>, DecryptionError> {
                 $compute_key(key, obj_id)
             }
 
             fn encrypt(&self, key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, DecryptionError> {
-                let key: &[u8; $key_len] = key.try_into().map_err(|_| DecryptionError::InvalidKeyLength)?;
+                let key: &[u8; $key_len] = key
+                    .try_into()
+                    .map_err(|_| DecryptionError::InvalidKeyLength)?;
 
                 // The ciphertext needs to be a multiple of 16 bytes to include the padding.
                 let ciphertext_len = (plaintext.len() + 16) / 16 * 16;
@@ -127,27 +137,46 @@ macro_rules! aes_cbc_crypt_filter {
             }
 
             fn decrypt(&self, key: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, DecryptionError> {
-                let key: &[u8; $key_len] = key.try_into().map_err(|_| DecryptionError::InvalidKeyLength)?;
+                let key: &[u8; $key_len] = key
+                    .try_into()
+                    .map_err(|_| DecryptionError::InvalidKeyLength)?;
 
-                // Ensure that the ciphertext length is a multiple of 16 bytes.
-                if !ciphertext.len().is_multiple_of(16) {
-                    return Err(DecryptionError::InvalidCipherTextLength);
+                // pdfium fails soft: a payload shorter than the IV decrypts
+                // to empty, a partial trailing block is ignored, and invalid
+                // PKCS#5 padding leaves the block unpadded rather than
+                // dropping the object (cpdf_crypto_handler.cpp:211-233,
+                // 301-304).
+                if ciphertext.len() < 16 {
+                    return Ok(vec![]);
                 }
-
-                // There is nothing to decrypt if the ciphertext is empty or only contains the IV.
-                if ciphertext.is_empty() || ciphertext.len() == 16 {
+                let blocks = (ciphertext.len() - 16) / 16;
+                if blocks == 0 {
                     return Ok(vec![]);
                 }
 
                 let mut iv = [0x00u8; 16];
                 iv.copy_from_slice(&ciphertext[..16]);
+                let aligned = &ciphertext[16..16 + blocks * 16];
 
-                let data = &mut ciphertext[16..].to_vec();
+                if let Ok(plain) = <$dec>::new(key.into(), &iv.into())
+                    .decrypt_padded::<Pkcs5>(&mut aligned.to_vec())
+                {
+                    return Ok(plain.to_vec());
+                }
 
-                Ok(<$dec>::new(key.into(), &iv.into())
-                    .decrypt_padded::<Pkcs5>(data)
-                    .map_err(|_| DecryptionError::Padding)?
-                    .to_vec())
+                // Invalid padding: decrypt without removing any and drop the
+                // count only when it is a plausible 1..16 tail.
+                let mut plain = aligned.to_vec();
+                <$dec>::new(key.into(), &iv.into())
+                    .decrypt_padded::<NoPadding>(&mut plain)
+                    .map_err(|_| DecryptionError::Padding)?;
+                if let Some(&padding) = plain.last() {
+                    if padding > 0 && padding < 16 {
+                        let len = plain.len().saturating_sub(usize::from(padding));
+                        plain.truncate(len);
+                    }
+                }
+                Ok(plain)
             }
         }
     };
@@ -187,3 +216,26 @@ aes_cbc_crypt_filter!(
     Aes256CbcDec,
     aes256_compute_key
 );
+
+thread_local! {
+    static LAST_RC4: std::cell::RefCell<Option<(Vec<u8>, [u8; 256])>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Many objects contain several strings that share one per-object key; reuse
+/// the KSA state while the recursion visits them.
+fn with_cached_rc4<T>(key: &[u8], transform: impl FnOnce(&Rc4) -> T) -> T {
+    LAST_RC4.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let state = match cache.as_ref() {
+            Some((cached_key, state)) if cached_key == key => *state,
+            _ => {
+                let rc4 = Rc4::new(key);
+                let state = rc4.initial_state();
+                *cache = Some((key.to_vec(), state));
+                state
+            }
+        };
+        transform(&Rc4::from_state(state))
+    })
+}

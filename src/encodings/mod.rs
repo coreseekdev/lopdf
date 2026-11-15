@@ -37,37 +37,16 @@ pub fn write_to_bytes(encoding: &CodedCharacterSet, text: &str, out: &mut Vec<u8
     for c in text.encode_utf16() {
         let g = Glyph::from_utf16_code_unit(c);
 
-        let Some(n) = encoding.iter().position(|glyph| glyph.is_some_and(|f| f == g)) else {
+        let Some(n) = encoding
+            .iter()
+            .position(|glyph| glyph.is_some_and(|f| f == g))
+        else {
             continue;
         };
 
         out.push(n as u8);
     }
 }
-
-/// The predefined CMaps whose character codes are Unicode values (ISO 32000-1:2008, 9.7.5.2,
-/// Table 118): names containing "UCS2" use UCS-2 and names containing "UTF16" use UTF-16BE,
-/// so both are decoded as UTF-16BE.
-const UNICODE_PREDEFINED_CMAPS: &[&[u8]] = &[
-    b"UniGB-UCS2-H",
-    b"UniGB-UCS2-V",
-    b"UniGB-UTF16-H",
-    b"UniGB-UTF16-V",
-    b"UniCNS-UCS2-H",
-    b"UniCNS-UCS2-V",
-    b"UniCNS-UTF16-H",
-    b"UniCNS-UTF16-V",
-    b"UniJIS-UCS2-H",
-    b"UniJIS-UCS2-V",
-    b"UniJIS-UCS2-HW-H",
-    b"UniJIS-UCS2-HW-V",
-    b"UniJIS-UTF16-H",
-    b"UniJIS-UTF16-V",
-    b"UniKS-UCS2-H",
-    b"UniKS-UCS2-V",
-    b"UniKS-UTF16-H",
-    b"UniKS-UTF16-V",
-];
 
 pub enum Encoding<'a> {
     OneByteEncoding(&'a CodedCharacterSet),
@@ -101,7 +80,7 @@ impl Encoding<'_> {
                 bytes_to_string(map, bytes, out)?;
                 Ok(())
             }
-            Self::SimpleEncoding(name) if UNICODE_PREDEFINED_CMAPS.contains(name) => {
+            Self::SimpleEncoding(b"UniGB-UCS2-H") | Self::SimpleEncoding(b"UniGB-UTF16-H") => {
                 out.push_str(UTF_16BE.decode(bytes).0.as_ref());
                 Ok(())
             }
@@ -113,15 +92,16 @@ impl Encoding<'_> {
                 let mut considered_source_code = 0u32;
                 for byte in bytes {
                     if bytes_in_considered_code == 4 {
-                        let mut value = unicode_map.get_or_replacement_char(considered_source_code, 4);
+                        let mut value =
+                            unicode_map.get_or_replacement_char(considered_source_code, 4);
                         considered_source_code = 0;
                         bytes_in_considered_code = 0;
                         output_bytes.append(&mut value);
                     }
                     bytes_in_considered_code += 1;
                     considered_source_code = considered_source_code * 256 + *byte as u32;
-                    if let Some(mut value) =
-                        unicode_map.get_for_decoding(considered_source_code, bytes_in_considered_code)
+                    if let Some(mut value) = unicode_map
+                        .get_for_decoding(considered_source_code, bytes_in_considered_code)
                     {
                         considered_source_code = 0;
                         bytes_in_considered_code = 0;
@@ -129,8 +109,8 @@ impl Encoding<'_> {
                     }
                 }
                 if bytes_in_considered_code > 0 {
-                    let mut value =
-                        unicode_map.get_or_replacement_char(considered_source_code, bytes_in_considered_code);
+                    let mut value = unicode_map
+                        .get_or_replacement_char(considered_source_code, bytes_in_considered_code);
                     output_bytes.append(&mut value);
                 }
                 let utf16_str: Vec<u8> = output_bytes
@@ -162,13 +142,17 @@ impl Encoding<'_> {
             Self::SimpleEncoding(b"UniGB-UCS2-H") | Self::SimpleEncoding(b"UniGB-UTF16-H") => {
                 encode_utf16_be(text, out)
             }
-            Self::SimpleEncoding(b"WinAnsiEncoding") => write_to_bytes(&WIN_ANSI_ENCODING, text, out),
+            Self::SimpleEncoding(b"WinAnsiEncoding") => {
+                write_to_bytes(&WIN_ANSI_ENCODING, text, out)
+            }
             Self::UnicodeMapEncoding(unicode_map) => {
                 let mut i = 0;
                 while i < text.chars().count() {
                     let current_unicode_seq: Vec<u16> = substr(text, i, 1).encode_utf16().collect();
 
-                    if let Some(entries) = unicode_map.get_source_codes_for_unicode(&current_unicode_seq) {
+                    if let Some(entries) =
+                        unicode_map.get_source_codes_for_unicode(&current_unicode_seq)
+                    {
                         if let Some(entry) = entries.first() {
                             // TODO: Add logic to pick the best entry if multiple
                             let mut bytes_for_code = Vec::new();
@@ -241,56 +225,24 @@ mod tests {
     fn unicode_with_2byte_code_does_not_convert_single_bytes() {
         let mut cmap = ToUnicodeCMap::new();
 
-        cmap.put(0x0000, 0x0002, 2, cmap::BfRangeTarget::UTF16CodePoint { offset: 0 });
-        cmap.put(0x0024, 0x0025, 2, cmap::BfRangeTarget::UTF16CodePoint { offset: 0 });
+        cmap.put(
+            0x0000,
+            0x0002,
+            2,
+            cmap::BfRangeTarget::UTF16CodePoint { offset: 0 },
+        );
+        cmap.put(
+            0x0024,
+            0x0025,
+            2,
+            cmap::BfRangeTarget::UTF16CodePoint { offset: 0 },
+        );
 
         let bytes: [u8; 2] = [0x00, 0x24];
 
         let result = Encoding::UnicodeMapEncoding(cmap).bytes_to_string(&bytes);
 
         assert_eq!(result.unwrap(), "\u{0024}");
-    }
-
-    #[test]
-    fn unicode_predefined_cmaps_decode_as_utf16_be() {
-        // Every name in ISO 32000-1 Table 118 that contains "UCS2" or "UTF16".
-        let names: [&[u8]; 18] = [
-            b"UniGB-UCS2-H",
-            b"UniGB-UCS2-V",
-            b"UniGB-UTF16-H",
-            b"UniGB-UTF16-V",
-            b"UniCNS-UCS2-H",
-            b"UniCNS-UCS2-V",
-            b"UniCNS-UTF16-H",
-            b"UniCNS-UTF16-V",
-            b"UniJIS-UCS2-H",
-            b"UniJIS-UCS2-V",
-            b"UniJIS-UCS2-HW-H",
-            b"UniJIS-UCS2-HW-V",
-            b"UniJIS-UTF16-H",
-            b"UniJIS-UTF16-V",
-            b"UniKS-UCS2-H",
-            b"UniKS-UCS2-V",
-            b"UniKS-UTF16-H",
-            b"UniKS-UTF16-V",
-        ];
-        for name in names {
-            let decoded = Encoding::SimpleEncoding(name).bytes_to_string(&[0x30, 0x42, 0xAC, 0x00]);
-            assert_eq!(decoded.unwrap(), "あ가", "{}", String::from_utf8_lossy(name));
-        }
-    }
-
-    #[test]
-    fn unicode_predefined_utf16_cmap_decodes_surrogate_pairs() {
-        // U+2000B, a CJK Extension B character, as a UTF-16BE surrogate pair.
-        let decoded = Encoding::SimpleEncoding(b"UniJIS-UTF16-V").bytes_to_string(&[0xD8, 0x40, 0xDC, 0x0B]);
-        assert_eq!(decoded.unwrap(), "\u{2000B}");
-    }
-
-    #[test]
-    fn non_unicode_predefined_cmap_is_still_unsupported() {
-        let decoded = Encoding::SimpleEncoding(b"90ms-RKSJ-H").bytes_to_string(&[0x82, 0xA0]);
-        assert!(matches!(decoded, Err(Error::CharacterEncoding)));
     }
 
     #[test]

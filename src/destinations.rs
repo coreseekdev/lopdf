@@ -1,4 +1,4 @@
-use super::{Dictionary, Document, Object, Result};
+use super::{Dictionary, Document, Object, PdfName, Result};
 use indexmap::IndexMap;
 #[derive(Debug, Clone)]
 pub struct Destination(Dictionary);
@@ -14,7 +14,7 @@ impl Destination {
 
     pub fn set<K, V>(&mut self, key: K, value: V)
     where
-        K: Into<Vec<u8>>,
+        K: Into<PdfName>,
         V: Into<Object>,
     {
         self.0.set(key, value);
@@ -27,55 +27,95 @@ impl Destination {
     pub fn page(&self) -> Result<&Object> {
         self.0.get(b"Page")
     }
+
+    /// Any additional outline attribute copied from the item dictionary
+    /// (`/Count`, `/F`, `/C`, `/Action`).
+    pub fn get(&self, key: &[u8]) -> Result<&Object> {
+        self.0.get(key)
+    }
 }
 
 impl Document {
     pub fn get_named_destinations(
-        &self, tree: &Dictionary, named_destinations: &mut IndexMap<Vec<u8>, Destination>,
+        &self,
+        tree: &Dictionary,
+        named_destinations: &mut IndexMap<Vec<u8>, Destination>,
     ) -> Result<()> {
         self.get_named_destinations_impl(tree, named_destinations, 0)
     }
 
     fn get_named_destinations_impl(
-        &self, tree: &Dictionary, named_destinations: &mut IndexMap<Vec<u8>, Destination>, depth: usize,
+        &self,
+        tree: &Dictionary,
+        named_destinations: &mut IndexMap<Vec<u8>, Destination>,
+        depth: usize,
     ) -> Result<()> {
         if depth >= crate::reader::MAX_NESTING_DEPTH {
             return Err(crate::Error::RecursionLimit);
         }
-        if let Ok(kids) = tree.get_deref(b"Kids", self) {
+        if let Ok(kids) = tree.get(b"Kids") {
             for kid in kids.as_array()? {
-                if let Ok(kid) = kid.as_reference().and_then(move |id| self.get_dictionary(id)) {
+                if let Ok(kid) = kid
+                    .as_reference()
+                    .and_then(move |id| self.get_dictionary(id))
+                {
                     self.get_named_destinations_impl(kid, named_destinations, depth + 1)?;
                 }
             }
         }
-        if let Ok(names) = tree.get_deref(b"Names", self) {
-            for [key, val] in names.as_array()?.as_chunks::<2>().0 {
-                // Skip entries that aren't a string key with a usable destination.
-                let Ok(name) = key.as_str() else {
+        // /Names may be an indirect reference (writers commonly store the
+        // array out-of-line); resolve before reading (pdfium
+        // CPDF_NameTree::Lookup old-walk dereferences too).
+        if let Ok(names) = tree
+            .get(b"Names")
+            .and_then(|object| self.dereference(object))
+            .map(|(_, object)| object.clone())
+        {
+            let mut names = names.as_array()?.iter();
+            loop {
+                let key = names.next();
+                if key.is_none() {
+                    break;
+                }
+                let val = names.next();
+                if val.is_none() {
+                    break;
+                }
+                // A name-tree key must be a string; the value is either a
+                // reference to an action dict (/D destination), a direct
+                // destination array, or the destination dict itself.
+                // Malformed entries skip without panicking.
+                let Some(key) = key.and_then(|object| object.as_str().ok().map(|key| key.to_vec())) else {
                     continue;
                 };
-                let val = match val {
-                    Object::Reference(id) => match self.get_object(*id) {
-                        Ok(val) => val,
-                        Err(_) => continue,
+                let value = match val.and_then(|object| object.as_reference().ok()) {
+                    Some(obj_ref) => match self.get_object(obj_ref) {
+                        Ok(Object::Dictionary(dict)) => dict
+                            .get(b"D")
+                            .and_then(Object::as_array)
+                            .ok()
+                            .map(|array| array.clone()),
+                        Ok(Object::Array(array)) => Some(array.clone()),
+                        _ => None,
                     },
-                    val => val,
-                };
-                let array = match val {
-                    Object::Array(array) => array,
-                    Object::Dictionary(dict) => match dict.get_deref(b"D", self).and_then(Object::as_array) {
-                        Ok(array) => array,
-                        Err(_) => continue,
+                    _ => match val.and_then(|object| object.as_array().ok()) {
+                        Some(array) => Some(array.clone()),
+                        None => match val.and_then(|object| object.as_dict().ok()) {
+                            Some(dict) => dict.get(b"D").and_then(Object::as_array).ok().map(|array| array.clone()),
+                            None => None,
+                        },
                     },
-                    _ => continue,
                 };
-                if let [page, typ, ..] = array.as_slice() {
-                    let dest = Destination::new(key.clone(), page.clone(), typ.clone());
-                    named_destinations.insert(name.to_vec(), dest);
+                if let Some(array) = value {
+                    if array.len() >= 2 {
+                        let dest =
+                            Destination::new(Object::string_literal(key.clone()), array[0].clone(), array[1].clone());
+                        named_destinations.insert(key, dest);
+                    }
                 }
             }
         }
         Ok(())
     }
 }
+

@@ -1,4 +1,5 @@
-use crate::{Dictionary, Document, Error, Object, ObjectId, Result};
+use crate::Result;
+use crate::{Dictionary, Document, Object, ObjectId, PdfName};
 #[cfg(feature = "font_embedding")]
 use crate::{FontData, Stream};
 
@@ -11,38 +12,17 @@ impl Document {
     }
 
     /// Create an object ID.
-    ///
-    /// # Panics
-    ///
-    /// Panics if [`Document::max_id`] is already `u32::MAX`. Use
-    /// [`Document::try_new_object_id`] to get an error instead.
     pub fn new_object_id(&mut self) -> ObjectId {
-        self.try_new_object_id().unwrap_or_else(|err| panic!("{err}"))
-    }
-
-    /// Create an object ID, or return [`Error::ObjectIdOverflow`] if [`Document::max_id`] is
-    /// already `u32::MAX`.
-    pub fn try_new_object_id(&mut self) -> Result<ObjectId> {
-        self.max_id = self.max_id.checked_add(1).ok_or(Error::ObjectIdOverflow)?;
-        Ok((self.max_id, 0))
+        self.max_id += 1;
+        (self.max_id, 0)
     }
 
     /// Add PDF object into document's object list.
-    ///
-    /// # Panics
-    ///
-    /// Panics if [`Document::max_id`] is already `u32::MAX`. Use
-    /// [`Document::try_add_object`] to get an error instead.
     pub fn add_object<T: Into<Object>>(&mut self, object: T) -> ObjectId {
-        self.try_add_object(object).unwrap_or_else(|err| panic!("{err}"))
-    }
-
-    /// Add PDF object into document's object list, or return [`Error::ObjectIdOverflow`] if
-    /// [`Document::max_id`] is already `u32::MAX`.
-    pub fn try_add_object<T: Into<Object>>(&mut self, object: T) -> Result<ObjectId> {
-        let id = self.try_new_object_id()?;
+        self.max_id += 1;
+        let id = (self.max_id, 0);
         self.objects.insert(id, object.into());
-        Ok(id)
+        id
     }
 
     pub fn set_object<T: Into<Object>>(&mut self, id: ObjectId, object: T) {
@@ -65,7 +45,10 @@ impl Document {
     pub fn remove_annot(&mut self, object_id: &ObjectId) -> Result<()> {
         for (_, page_id) in self.get_pages() {
             // `/Annots` may be missing, an array in the page, or a reference to an array.
-            let annots_id = match self.get_dictionary(page_id).and_then(|page| page.get(b"Annots")) {
+            let annots_id = match self
+                .get_dictionary(page_id)
+                .and_then(|page| page.get(b"Annots"))
+            {
                 Ok(Object::Reference(id)) => Some(*id),
                 Ok(Object::Array(_)) => None,
                 _ => continue,
@@ -98,16 +81,13 @@ impl Document {
     /// Get the page's resource dictionary.
     ///
     /// Get Object that has the key "Resources".
-    ///
-    /// A page without its own `/Resources` gets a copy of the one it inherits from the page
-    /// tree, if any, so that adding a resource does not hide the inherited ones.
     pub fn get_or_create_resources(&mut self, page_id: ObjectId) -> Result<&mut Object> {
-        let (resources_id, inherited) = {
+        let resources_id = {
             let page = self.get_object(page_id).and_then(Object::as_dict)?;
             if page.has(b"Resources") {
-                (page.get(b"Resources").and_then(Object::as_reference).ok(), None)
+                page.get(b"Resources").and_then(Object::as_reference).ok()
             } else {
-                (None, self.inherited_resources(page).ok().flatten().cloned())
+                None
             }
         };
         if let Some(res_id) = resources_id {
@@ -115,7 +95,7 @@ impl Document {
         }
         let page = self.get_object_mut(page_id).and_then(Object::as_dict_mut)?;
         if !page.has(b"Resources") {
-            page.set(b"Resources", inherited.unwrap_or_default());
+            page.set(b"Resources", Dictionary::new());
         }
         page.get_mut(b"Resources")
     }
@@ -123,10 +103,16 @@ impl Document {
     /// Add XObject to a page.
     ///
     /// Get Object that has the key `Resources -> XObject`.
-    pub fn add_xobject<N: Into<Vec<u8>>>(
-        &mut self, page_id: ObjectId, xobject_name: N, xobject_id: ObjectId,
+    pub fn add_xobject<N: Into<PdfName>>(
+        &mut self,
+        page_id: ObjectId,
+        xobject_name: N,
+        xobject_id: ObjectId,
     ) -> Result<()> {
-        if let Ok(resources) = self.get_or_create_resources(page_id).and_then(Object::as_dict_mut) {
+        if let Ok(resources) = self
+            .get_or_create_resources(page_id)
+            .and_then(Object::as_dict_mut)
+        {
             if !resources.has(b"XObject") {
                 resources.set("XObject", Dictionary::new());
             }
@@ -147,18 +133,22 @@ impl Document {
     /// Add Graphics State to a page.
     ///
     /// Get Object that has the key `Resources -> ExtGState`.
-    pub fn add_graphics_state<N: Into<Vec<u8>>>(
-        &mut self, page_id: ObjectId, gs_name: N, gs_id: ObjectId,
+    pub fn add_graphics_state<N: Into<PdfName>>(
+        &mut self,
+        page_id: ObjectId,
+        gs_name: N,
+        gs_id: ObjectId,
     ) -> Result<()> {
-        if let Ok(resources) = self.get_or_create_resources(page_id).and_then(Object::as_dict_mut) {
+        if let Ok(resources) = self
+            .get_or_create_resources(page_id)
+            .and_then(Object::as_dict_mut)
+        {
             if !resources.has(b"ExtGState") {
                 resources.set("ExtGState", Dictionary::new());
             }
-            let mut states = resources.get_mut(b"ExtGState")?;
-            if let Object::Reference(states_id) = *states {
-                states = self.get_object_mut(states_id)?;
-            }
-            let states = Object::as_dict_mut(states)?;
+            let states = resources
+                .get_mut(b"ExtGState")
+                .and_then(Object::as_dict_mut)?;
             states.set(gs_name, Object::Reference(gs_id));
         }
         Ok(())
@@ -336,7 +326,10 @@ pub mod tests {
         doc.trailer.set("Info", info_id);
         doc.trailer.set(
             "ID",
-            Object::Array(vec![Object::string_literal(b"ABC"), Object::string_literal(b"DEF")]),
+            Object::Array(vec![
+                Object::string_literal(b"ABC"),
+                Object::string_literal(b"DEF"),
+            ]),
         );
         doc.compress();
         doc
@@ -387,7 +380,10 @@ pub mod tests {
         doc.trailer.set("Info", info_id);
         doc.trailer.set(
             "ID",
-            Object::Array(vec![Object::string_literal(b"ABC"), Object::string_literal(b"DEF")]),
+            Object::Array(vec![
+                Object::string_literal(b"ABC"),
+                Object::string_literal(b"DEF"),
+            ]),
         );
         doc.compress();
         doc
@@ -448,7 +444,10 @@ pub mod tests {
         let font_dict = font_obj.as_dict().unwrap();
 
         // Check base font name
-        assert_eq!(font_dict.get(b"BaseFont").unwrap(), &Object::Name(b"MyFont".to_vec()));
+        assert_eq!(
+            font_dict.get(b"BaseFont").unwrap(),
+            &Object::Name(b"MyFont".to_vec())
+        );
 
         // Check encoding
         assert_eq!(
@@ -457,7 +456,11 @@ pub mod tests {
         );
 
         // Check font descriptor exists and is referenced
-        let descriptor_ref = font_dict.get(b"FontDescriptor").unwrap().as_reference().unwrap();
+        let descriptor_ref = font_dict
+            .get(b"FontDescriptor")
+            .unwrap()
+            .as_reference()
+            .unwrap();
         let descriptor_obj = doc.get_object(descriptor_ref).unwrap().as_dict().unwrap();
         assert_eq!(
             descriptor_obj.get(b"FontName").unwrap(),
@@ -465,7 +468,11 @@ pub mod tests {
         );
 
         // Check font file is embedded
-        let font_file_ref = descriptor_obj.get(b"FontFile2").unwrap().as_reference().unwrap();
+        let font_file_ref = descriptor_obj
+            .get(b"FontFile2")
+            .unwrap()
+            .as_reference()
+            .unwrap();
         let font_stream = doc.get_object(font_file_ref).unwrap().as_stream().unwrap();
         assert_eq!(font_stream.content, font_file);
     }

@@ -1,5 +1,5 @@
 use std::convert::{TryFrom, TryInto};
-use std::io::{Error, ErrorKind, Read, Result, Write};
+use std::io::{Error, ErrorKind, Result};
 use std::mem;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,8 +69,9 @@ pub fn decode_row(filter: FilterType, bpp: usize, previous: &[u8], current: &mut
             }
 
             for i in bpp..len {
-                current[i] =
-                    current[i].wrapping_add(((i16::from(current[i - bpp]) + i16::from(previous[i])) / 2) as u8);
+                current[i] = current[i].wrapping_add(
+                    ((i16::from(current[i - bpp]) + i16::from(previous[i])) / 2) as u8,
+                );
             }
         }
         Paeth => {
@@ -79,43 +80,52 @@ pub fn decode_row(filter: FilterType, bpp: usize, previous: &[u8], current: &mut
             }
 
             for i in bpp..len {
-                current[i] = current[i].wrapping_add(paeth_predict(current[i - bpp], previous[i], previous[i - bpp]));
+                current[i] = current[i].wrapping_add(paeth_predict(
+                    current[i - bpp],
+                    previous[i],
+                    previous[i - bpp],
+                ));
             }
         }
     }
 }
 
 pub fn decode_frame(content: &[u8], bpp: usize, bytes_per_row: usize) -> Result<Vec<u8>> {
-    if content.is_empty() {
-        return Ok(Vec::new());
-    }
-    // A complete row must be present before its metadata can size scratch buffers.
-    if bytes_per_row > content.len() - 1 {
-        return Err(Error::new(ErrorKind::UnexpectedEof, "incomplete PNG predictor row"));
-    }
-    let mut previous = Vec::new();
-    previous.try_reserve(bytes_per_row)?;
-    previous.resize(bytes_per_row, 0_u8);
-    let mut current = Vec::new();
-    current.try_reserve(bytes_per_row)?;
-    current.resize(bytes_per_row, 0_u8);
     let mut decoded = Vec::new();
+    if content.is_empty() {
+        return Ok(decoded);
+    }
+    // Each row is one filter-type byte plus at most `bytes_per_row` payload
+    // bytes.  The allocation is bounded by the input: `/DecodeParms` may
+    // request an arbitrarily large row.
+    let row_capacity = bytes_per_row.min(content.len() - 1);
+    let mut previous = Vec::new();
+    previous.try_reserve(row_capacity)?;
+    previous.resize(row_capacity, 0_u8);
+    let mut current = Vec::new();
+    current.try_reserve(row_capacity)?;
+    current.resize(row_capacity, 0_u8);
     let mut pos = 0;
     while pos < content.len() {
-        if let Ok(filter) = content[pos].try_into() {
-            pos += 1;
-            (&content[pos..]).read_exact(current.as_mut_slice())?;
-            pos += bytes_per_row;
-
-            decode_row(filter, bpp, previous.as_slice(), current.as_mut_slice());
-            decoded.write_all(current.as_slice())?;
-            mem::swap(&mut previous, &mut current);
-        } else {
+        let Ok(filter) = content[pos].try_into() else {
             return Err(Error::new(
                 ErrorKind::InvalidData,
                 format!("invalid PNG filter type ({})", content[pos]),
             ));
-        }
+        };
+        pos += 1;
+        // The final row may be shorter than a full row.  Decode the bytes
+        // that are present instead of dropping the row: pdfium's
+        // PngPredictor sizes its last output row from the remainder
+        // (image_predictors.cpp, PngPredictor), so a cross-reference stream
+        // whose last entry is cut short still yields that partial entry.
+        let len = (content.len() - pos).min(bytes_per_row);
+        current[..len].copy_from_slice(&content[pos..pos + len]);
+        pos += len;
+
+        decode_row(filter, bpp, &previous[..len], &mut current[..len]);
+        decoded.extend_from_slice(&current[..len]);
+        mem::swap(&mut previous, &mut current);
     }
     Ok(decoded)
 }
@@ -139,8 +149,9 @@ pub fn encode_row(method: FilterType, bpp: usize, previous: &[u8], current: &mut
         }
         Avg => {
             for i in (bpp..len).rev() {
-                current[i] =
-                    current[i].wrapping_sub(((u16::from(current[i - bpp]) + u16::from(previous[i])) / 2) as u8);
+                current[i] = current[i].wrapping_sub(
+                    ((u16::from(current[i - bpp]) + u16::from(previous[i])) / 2) as u8,
+                );
             }
 
             for i in 0..bpp {
@@ -149,7 +160,11 @@ pub fn encode_row(method: FilterType, bpp: usize, previous: &[u8], current: &mut
         }
         Paeth => {
             for i in (bpp..len).rev() {
-                current[i] = current[i].wrapping_sub(paeth_predict(current[i - bpp], previous[i], previous[i - bpp]));
+                current[i] = current[i].wrapping_sub(paeth_predict(
+                    current[i - bpp],
+                    previous[i],
+                    previous[i - bpp],
+                ));
             }
 
             for i in 0..bpp {

@@ -23,28 +23,9 @@ pub enum XrefType {
     CrossReferenceTable,
 }
 
-/// How lenient loading repaired cross-reference data that it could not read as written.
-///
-/// Loading reports it in [`Document::xref_recovery`](crate::Document::xref_recovery) and
-/// [`PdfMetadata::xref_recovery`](crate::PdfMetadata::xref_recovery). Strict loading never
-/// repairs and fails instead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum XrefRecovery {
-    /// A `startxref`, `/Prev` or `/XRefStm` offset did not point at a cross-reference
-    /// section, and a section found nearby was used instead.
-    OffsetCorrected,
-    /// The table was rebuilt by scanning the file for indirect objects: the cross-reference
-    /// data could not be read, the catalog or the root of the page tree did not load from it,
-    /// or [`LoadOptions::force_reconstruct`](crate::LoadOptions::force_reconstruct) asked for
-    /// it. Objects may be missing or come from an older revision. When no trailer survives,
-    /// the trailer names only the newest catalog found as `/Root`.
-    Reconstructed,
-}
-
 #[derive(Debug, Clone)]
 pub enum XrefEntry {
-    Free, // TODO add generation number
+    Free { generation: u16 },
     UnusableFree,
     Normal { offset: u32, generation: u16 },
     Compressed { container: u32, index: u16 },
@@ -74,22 +55,24 @@ impl Xref {
         self.size = self.size.max(id.saturating_add(1));
     }
 
-    /// Combine Xref entries. Only add them if they do not exists already.
-    /// Do not replace existing entries.
+    /// Combine Xref entries.  Newer sections win; between two live entries
+    /// for the same object number the higher generation wins (pdfium
+    /// CPDF_CrossRefTable, cpdf_cross_ref_table.cpp:74,85-93).
     pub fn merge(&mut self, xref: Xref) {
         for (id, entry) in xref.entries {
-            self.entries.entry(id).or_insert(entry);
-        }
-    }
-
-    /// Add the entries of the cross-reference stream that a hybrid-reference file's table
-    /// names with `/XRefStm`. They replace the table's free entries, which hide the objects
-    /// in object streams from readers that only understand tables.
-    pub fn merge_hybrid(&mut self, xref: Xref) {
-        for (id, entry) in xref.entries {
-            match self.entries.get(&id) {
-                Some(XrefEntry::Normal { .. } | XrefEntry::Compressed { .. }) => {}
-                _ => self.insert(id, entry),
+            let replace = match (&entry, self.entries.get(&id)) {
+                (_, None) => true,
+                (
+                    XrefEntry::Normal {
+                        generation: incoming,
+                        ..
+                    },
+                    Some(XrefEntry::Normal { generation, .. }),
+                ) => incoming > generation,
+                _ => false,
+            };
+            if replace {
+                self.entries.insert(id, entry);
             }
         }
     }
@@ -120,7 +103,13 @@ impl XrefEntry {
         let mut result = Vec::new();
 
         match self {
-            XrefEntry::Free | XrefEntry::UnusableFree => {
+            XrefEntry::Free { generation } => {
+                // Type 0: Free object
+                encode_field(0, widths[0], &mut result);
+                encode_field(0, widths[1], &mut result); // Next free object
+                encode_field(u64::from(*generation), widths[2], &mut result);
+            }
+            XrefEntry::UnusableFree => {
                 // Type 0: Free object
                 encode_field(0, widths[0], &mut result);
                 encode_field(0, widths[1], &mut result); // Next free object
@@ -149,11 +138,14 @@ impl XrefEntry {
             XrefEntry::Normal { offset, generation } => {
                 writeln!(file, "{offset:>010} {generation:>05} n ")?;
             }
-            XrefEntry::Compressed { container: _, index: _ } => {
+            XrefEntry::Compressed {
+                container: _,
+                index: _,
+            } => {
                 writeln!(file, "{:>010} {:>05} f ", 0, 65535)?;
             }
-            XrefEntry::Free => {
-                writeln!(file, "{:>010} {:>05} f ", 0, 0)?;
+            XrefEntry::Free { generation } => {
+                writeln!(file, "{:>010} {generation:>05} f ", 0)?;
             }
             XrefEntry::UnusableFree => {
                 writeln!(file, "{:>010} {:>05} f ", 0, 65535)?;
@@ -216,7 +208,11 @@ pub struct XrefStreamBuilder<'a> {
 impl<'a> XrefStreamBuilder<'a> {
     /// Create a new builder from an Xref
     pub fn new(xref: &'a Xref) -> Self {
-        let entries: Vec<_> = xref.entries.iter().map(|(&id, entry)| (id, entry)).collect();
+        let entries: Vec<_> = xref
+            .entries
+            .iter()
+            .map(|(&id, entry)| (id, entry))
+            .collect();
 
         Self {
             xref,

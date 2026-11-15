@@ -12,7 +12,6 @@ pub mod xref;
 mod object;
 mod document;
 mod incremental_document;
-mod linearization;
 
 mod bookmarks;
 mod cmap_section;
@@ -20,7 +19,7 @@ mod common_data_structures;
 mod creator;
 mod datetime;
 mod destinations;
-mod encodings;
+pub mod encodings;
 mod error;
 mod outlines;
 mod processor;
@@ -38,24 +37,23 @@ mod save_options;
 mod font;
 
 pub use document::Document;
-pub use object::{Dictionary, Object, ObjectId, Stream, StringFormat};
+pub use object::{Dictionary, Object, ObjectId, PdfName, PdfString, Stream, StringFormat};
 
 pub use bookmarks::Bookmark;
 pub use common_data_structures::{decode_text_string, text_string};
 pub use datetime::DateTime;
 pub use destinations::Destination;
+pub use encodings::cmap::ToUnicodeCMap;
 pub use encodings::{Encoding, encode_utf8, encode_utf16_be};
 pub use encryption::{EncryptionState, EncryptionVersion, Permissions};
 pub use error::{DecompressError, Error, ParseError, Result};
 pub use incremental_document::IncrementalDocument;
-pub use linearization::Linearization;
-pub use load_options::{DEFAULT_MAX_DECOMPRESSED_SIZE, FilterFunc, LoadOptions};
+pub use load_options::{FilterFunc, LoadOptions};
 pub use object_stream::{ObjectStream, ObjectStreamBuilder, ObjectStreamConfig};
 pub use outlines::Outline;
-pub use reader::{PdfMetadata, Reader};
+pub use reader::{PdfMetadata, RangeSource, Reader};
 pub use save_options::{SaveOptions, SaveOptionsBuilder};
 pub use toc::{Toc, TocType};
-pub use writer::Writer;
 
 pub use parser_aux::substr;
 pub use parser_aux::substring;

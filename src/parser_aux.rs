@@ -1,7 +1,8 @@
 use log::warn;
 
+use crate::{Dictionary, Object, ObjectId, Stream, parser};
 use crate::{
-    DEFAULT_MAX_DECOMPRESSED_SIZE, Error, Result,
+    Error, Result,
     content::{Content, Operation},
     document::Document,
     encodings::Encoding,
@@ -9,7 +10,6 @@ use crate::{
     object::Object::Name,
     xref::{Xref, XrefEntry, XrefType},
 };
-use crate::{Dictionary, Object, ObjectId, Stream, parser};
 use std::{
     collections::BTreeMap,
     io::{Cursor, Read},
@@ -44,37 +44,44 @@ impl Stream {
 
 impl Document {
     /// Get decoded page content;
-    pub fn get_and_decode_page_content(&self, page_id: ObjectId) -> Result<Content<Vec<Operation>>> {
+    pub fn get_and_decode_page_content(
+        &self,
+        page_id: ObjectId,
+    ) -> Result<Content<Vec<Operation>>> {
         let content_data = self.get_page_content(page_id);
         Content::decode(&content_data)
     }
 
     /// Add content to a page. All existing content will be unchanged.
-    pub fn add_to_page_content(&mut self, page_id: ObjectId, content: Content<Vec<Operation>>) -> Result<()> {
+    pub fn add_to_page_content(
+        &mut self,
+        page_id: ObjectId,
+        content: Content<Vec<Operation>>,
+    ) -> Result<()> {
         let content_data = Content::encode(&content)?;
         self.add_page_contents(page_id, content_data)?;
         Ok(())
     }
 
-    /// Extract text from the given pages.
-    ///
-    /// The decompressed content of each page is bounded by
-    /// [`DEFAULT_MAX_DECOMPRESSED_SIZE`](crate::DEFAULT_MAX_DECOMPRESSED_SIZE); a page
-    /// over it fails with
-    /// [`DecompressError::MemoryLimitExceeded`](crate::DecompressError::MemoryLimitExceeded).
-    /// Use [`Document::extract_text_with_limit`] to choose a different bound.
     pub fn extract_text(&self, page_numbers: &[u32]) -> Result<String> {
-        self.extract_text_inner(page_numbers, Some(DEFAULT_MAX_DECOMPRESSED_SIZE))
+        self.extract_text_inner(page_numbers, None)
     }
 
     /// Extract text from the given pages, bounding the total decompressed content
     /// of each page to `max_decompressed_size` bytes.
     ///
-    /// Page content is decoded via [`Document::get_page_content_with_limit`], so a
-    /// small compressed content stream cannot inflate without limit. Returns
+    /// This is the decompression-bomb-safe counterpart to
+    /// [`Document::extract_text`]: page content is decoded via
+    /// [`Document::get_page_content_with_limit`], so a small compressed content
+    /// stream cannot inflate without limit. Prefer it over [`Document::extract_text`]
+    /// for PDFs from an untrusted source. Returns
     /// [`DecompressError::MemoryLimitExceeded`](crate::DecompressError::MemoryLimitExceeded)
     /// if any requested page's content would exceed the limit.
-    pub fn extract_text_with_limit(&self, page_numbers: &[u32], max_decompressed_size: usize) -> Result<String> {
+    pub fn extract_text_with_limit(
+        &self,
+        page_numbers: &[u32],
+        max_decompressed_size: usize,
+    ) -> Result<String> {
         self.extract_text_inner(page_numbers, Some(max_decompressed_size))
     }
 
@@ -89,27 +96,27 @@ impl Document {
         Ok(text)
     }
 
-    /// Extract text from the given pages as separate chunks.
-    ///
-    /// The decompressed content of each page is bounded by
-    /// [`DEFAULT_MAX_DECOMPRESSED_SIZE`](crate::DEFAULT_MAX_DECOMPRESSED_SIZE); a page
-    /// over it yields an `Err` chunk. Use [`Document::extract_text_chunks_with_limit`]
-    /// to choose a different bound.
     pub fn extract_text_chunks(&self, page_numbers: &[u32]) -> Vec<Result<String>> {
-        self.extract_text_chunks_inner(page_numbers, Some(DEFAULT_MAX_DECOMPRESSED_SIZE))
+        self.extract_text_chunks_inner(page_numbers, None)
     }
 
-    /// Counterpart to [`Document::extract_text_chunks`] with a caller-chosen bound on the
+    /// Bomb-safe counterpart to [`Document::extract_text_chunks`], bounding the
     /// total decompressed content of each page to `max_decompressed_size` bytes.
     /// A page whose content exceeds the limit yields an `Err` chunk carrying
     /// [`DecompressError::MemoryLimitExceeded`](crate::DecompressError::MemoryLimitExceeded).
     pub fn extract_text_chunks_with_limit(
-        &self, page_numbers: &[u32], max_decompressed_size: usize,
+        &self,
+        page_numbers: &[u32],
+        max_decompressed_size: usize,
     ) -> Vec<Result<String>> {
         self.extract_text_chunks_inner(page_numbers, Some(max_decompressed_size))
     }
 
-    fn extract_text_chunks_inner(&self, page_numbers: &[u32], limit: Option<usize>) -> Vec<Result<String>> {
+    fn extract_text_chunks_inner(
+        &self,
+        page_numbers: &[u32],
+        limit: Option<usize>,
+    ) -> Vec<Result<String>> {
         let pages: BTreeMap<u32, (u32, u16)> = self.get_pages();
         page_numbers
             .iter()
@@ -124,11 +131,16 @@ impl Document {
     }
 
     fn extract_text_chunks_from_page(
-        &self, pages: &BTreeMap<u32, (u32, u16)>, page_number: u32, limit: Option<usize>,
+        &self,
+        pages: &BTreeMap<u32, (u32, u16)>,
+        page_number: u32,
+        limit: Option<usize>,
     ) -> Result<Vec<Result<String>>> {
         let mut collected_chunks_and_errs: Vec<std::result::Result<String, Error>> = Vec::new();
 
-        let page_id = *pages.get(&page_number).ok_or(Error::PageNumberNotFound(page_number))?;
+        let page_id = *pages
+            .get(&page_number)
+            .ok_or(Error::PageNumberNotFound(page_number))?;
         let fonts = self.get_page_fonts(page_id)?;
         let encodings: BTreeMap<Vec<u8>, Encoding> = fonts
             .into_iter()
@@ -207,7 +219,11 @@ impl Document {
                             current_text.push('\n');
                         }
                         if let Some(string_operand) = operation.operands.get(2) {
-                            let res = collect_text(&mut current_text, encoding, std::slice::from_ref(string_operand));
+                            let res = collect_text(
+                                &mut current_text,
+                                encoding,
+                                std::slice::from_ref(string_operand),
+                            );
                             if let Err(err) = res {
                                 collected_chunks_and_errs.push(Err(err));
                             }
@@ -232,7 +248,11 @@ impl Document {
     }
 
     pub fn replace_text(
-        &mut self, page_number: u32, text: &str, other_text: &str, default_str: Option<&str>,
+        &mut self,
+        page_number: u32,
+        text: &str,
+        other_text: &str,
+        default_str: Option<&str>,
     ) -> Result<()> {
         let page = page_number.saturating_sub(1) as usize;
         let page_id = self
@@ -258,11 +278,17 @@ impl Document {
                     current_encoding = encodings.get(current_font);
                 }
                 "Tj" | "TJ" => match current_encoding {
-                    Some(encoding) => {
-                        try_to_replace_encoded_text(operation, encoding, text, other_text, default_str.unwrap_or(""))?
-                    }
+                    Some(encoding) => try_to_replace_encoded_text(
+                        operation,
+                        encoding,
+                        text,
+                        other_text,
+                        default_str.unwrap_or(""),
+                    )?,
                     None => {
-                        warn!("Could not decode extracted text, some of the occurances might not be properly replaced")
+                        warn!(
+                            "Could not decode extracted text, some of the occurances might not be properly replaced"
+                        )
                     }
                 },
                 _ => {}
@@ -273,7 +299,11 @@ impl Document {
     }
 
     pub fn replace_partial_text(
-        &mut self, page_number: u32, search_text: &str, replacement_text: &str, default_char: Option<&str>,
+        &mut self,
+        page_number: u32,
+        search_text: &str,
+        replacement_text: &str,
+        default_char: Option<&str>,
     ) -> Result<usize> {
         let page = page_number.saturating_sub(1) as usize;
         let page_id = self
@@ -328,7 +358,11 @@ impl Document {
     }
 
     pub fn insert_image(
-        &mut self, page_id: ObjectId, img_object: Stream, position: (f32, f32), size: (f32, f32),
+        &mut self,
+        page_id: ObjectId,
+        img_object: Stream,
+        position: (f32, f32),
+        size: (f32, f32),
     ) -> Result<()> {
         let img_id = self.add_object(img_object);
         let img_name = format!("X{}", img_id.0);
@@ -348,9 +382,10 @@ impl Document {
                 position.1.into(),
             ],
         ));
-        content
-            .operations
-            .push(Operation::new("Do", vec![Name(img_name.as_bytes().to_vec())]));
+        content.operations.push(Operation::new(
+            "Do",
+            vec![Name(img_name.as_bytes().to_vec().into())],
+        ));
         content.operations.push(Operation::new("Q", vec![]));
 
         self.change_page_content(page_id, content.encode()?)
@@ -363,9 +398,10 @@ impl Document {
         let mut content = self.get_and_decode_page_content(page_id)?;
         content.operations.insert(0, Operation::new("q", vec![]));
         content.operations.push(Operation::new("Q", vec![]));
-        content
-            .operations
-            .push(Operation::new("Do", vec![Name(form_name.as_bytes().to_vec())]));
+        content.operations.push(Operation::new(
+            "Do",
+            vec![Name(form_name.as_bytes().to_vec().into())],
+        ));
         let modified_content = content.encode()?;
         self.add_xobject(page_id, form_name, form_id)?;
 
@@ -418,7 +454,10 @@ pub fn substr(s: &str, start: usize, len: usize) -> &str {
 
 /// Everything from character index `start` to the end of `s`.
 pub fn substring(s: &str, start: usize) -> &str {
-    s.char_indices().nth(start).map(|(idx, _)| &s[idx..]).unwrap_or("")
+    s.char_indices()
+        .nth(start)
+        .map(|(idx, _)| &s[idx..])
+        .unwrap_or("")
 }
 
 fn encode(encoding: &Encoding, txt: &str, default_str: &str) -> Vec<u8> {
@@ -464,7 +503,11 @@ fn encode_one(encoding: &Encoding, c: char, default_str: &str) -> Vec<u8> {
 }
 
 fn try_to_replace_encoded_text(
-    operation: &mut Operation, encoding: &Encoding, text_to_replace: &str, replacement: &str, default_str: &str,
+    operation: &mut Operation,
+    encoding: &Encoding,
+    text_to_replace: &str,
+    replacement: &str,
+    default_str: &str,
 ) -> Result<()> {
     for operand in &mut operation.operands {
         match operand {
@@ -472,7 +515,7 @@ fn try_to_replace_encoded_text(
                 let decoded_text = Document::decode_text(encoding, bytes)?;
                 if decoded_text == text_to_replace {
                     let encoded_bytes = encode(encoding, replacement, default_str);
-                    *bytes = encoded_bytes;
+                    *bytes = encoded_bytes.into();
                 }
             }
             Object::Array(arr) => {
@@ -488,9 +531,9 @@ fn try_to_replace_encoded_text(
                     for item in arr.iter_mut() {
                         if let Object::String(bytes, _f) = item {
                             if placed {
-                                *bytes = Vec::new();
+                                *bytes = Vec::new().into();
                             } else {
-                                bytes.clone_from(&encoded_replacement);
+                                *bytes = encoded_replacement.clone().into();
                                 placed = true;
                             }
                         }
@@ -505,7 +548,11 @@ fn try_to_replace_encoded_text(
 }
 
 fn replace_partial_in_operation(
-    operation: &mut Operation, encoding: &Encoding, search_text: &str, replacement_text: &str, default_char: &str,
+    operation: &mut Operation,
+    encoding: &Encoding,
+    search_text: &str,
+    replacement_text: &str,
+    default_char: &str,
 ) -> Result<usize> {
     let mut replacement_count = 0;
 
@@ -516,13 +563,18 @@ fn replace_partial_in_operation(
                 if decoded_text.contains(search_text) {
                     let new_text = decoded_text.replace(search_text, replacement_text);
                     let encoded_bytes = encode_with_fallback(encoding, &new_text, default_char);
-                    *bytes = encoded_bytes;
+                    *bytes = encoded_bytes.into();
                     replacement_count += decoded_text.matches(search_text).count();
                 }
             }
             Object::Array(arr) => {
-                replacement_count +=
-                    replace_partial_in_array(arr, encoding, search_text, replacement_text, default_char)?;
+                replacement_count += replace_partial_in_array(
+                    arr,
+                    encoding,
+                    search_text,
+                    replacement_text,
+                    default_char,
+                )?;
             }
             _ => {}
         }
@@ -532,7 +584,11 @@ fn replace_partial_in_operation(
 }
 
 fn replace_partial_in_array(
-    arr: &mut [Object], encoding: &Encoding, search_text: &str, replacement_text: &str, default_char: &str,
+    arr: &mut [Object],
+    encoding: &Encoding,
+    search_text: &str,
+    replacement_text: &str,
+    default_char: &str,
 ) -> Result<usize> {
     let mut replacement_count = 0;
 
@@ -542,7 +598,7 @@ fn replace_partial_in_array(
             if decoded_text.contains(search_text) {
                 let new_text = decoded_text.replace(search_text, replacement_text);
                 let encoded_bytes = encode_with_fallback(encoding, &new_text, default_char);
-                *bytes = encoded_bytes;
+                *bytes = encoded_bytes.into();
                 replacement_count += decoded_text.matches(search_text).count();
             }
         }
@@ -560,18 +616,18 @@ fn encode_with_fallback(encoding: &Encoding, text: &str, default_char: &str) -> 
     encode(encoding, text, default_char)
 }
 
-/// Decode a cross-reference stream, bounding its decompressed content by
-/// [`DEFAULT_MAX_DECOMPRESSED_SIZE`](crate::DEFAULT_MAX_DECOMPRESSED_SIZE).
+/// Decode CrossReferenceStream
 pub fn decode_xref_stream(stream: Stream) -> Result<(Xref, Dictionary)> {
-    decode_xref_stream_with_limit(stream, Some(DEFAULT_MAX_DECOMPRESSED_SIZE))
+    decode_xref_stream_with_limit(stream, None)
 }
 
 /// Decode a cross-reference stream, rejecting it if its decompressed content
-/// would exceed `max_decompressed_size` bytes. `None` means no limit. Cross-reference
-/// streams are decoded early during loading, so this bounds the memory a `/XRef`
-/// stream can use.
+/// would exceed `max_decompressed_size` bytes. `None` means no limit (the
+/// behavior of [`decode_xref_stream`]). Cross-reference streams are decoded
+/// early during loading, so this bounds the memory a `/XRef` stream can use.
 pub fn decode_xref_stream_with_limit(
-    mut stream: Stream, max_decompressed_size: Option<usize>,
+    mut stream: Stream,
+    max_decompressed_size: Option<usize>,
 ) -> Result<(Xref, Dictionary)> {
     if stream.is_compressed() {
         match max_decompressed_size {
@@ -610,28 +666,18 @@ pub fn decode_xref_stream_with_limit(
             return Err(ParseError::InvalidXref.into());
         }
 
-        // Total bytes one entry consumes. With every width zero the loop below would spin on
-        // attacker-controlled /Index counts forever, so reject it (also avoids a division by zero).
+        // Total bytes one entry consumes. With every width zero no record has a body, so the
+        // loop below would insert attacker-chosen ids without consuming input; reject it.
         let entry_width = (field_widths[0] + field_widths[1] + field_widths[2]) as usize;
         if entry_width == 0 {
             return Err(ParseError::InvalidXref.into());
         }
 
-        let index_entries = section_indice
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .try_fold(0_usize, |total, section| {
-                let count = usize::try_from(section[1]).map_err(|_| ParseError::InvalidXref)?;
-                total.checked_add(count).ok_or(ParseError::InvalidXref)
-            })?;
-        // Validate the total before inserting anything so multiple plausible /Index sections
-        // cannot overrun the body. Records narrower than three bytes are rejected to limit
-        // amplification; lopdf's writer emits /W [1 4 2], so its own output is unaffected.
-        const MIN_ENTRY_WIDTH: usize = 3;
-        if index_entries > reader.get_ref().len() / entry_width.max(MIN_ENTRY_WIDTH) {
-            return Err(ParseError::InvalidXref.into());
-        }
+        // A truncated producer may declare more /Index entries than the decoded body
+        // carries (a cut-off predictor row leaves at most `entry_width - 1` bytes). The
+        // loop below stops at the last record that fits, so the declared count never
+        // sizes an allocation; requiring it to match the body would reject files that
+        // pdfium opens with the missing entries left unresolved.
 
         let mut bytes1 = vec![0_u8; field_widths[0] as usize];
         let mut bytes2 = vec![0_u8; field_widths[1] as usize];
@@ -643,6 +689,14 @@ pub fn decode_xref_stream_with_limit(
             let mut skipped = 0usize;
 
             for j in 0..count {
+                // A producer may truncate the last predictor row or the
+                // section; stop at the last complete entry instead of
+                // failing the whole xref (pdfium leaves missing entries
+                // unresolved).
+                let remaining = reader.get_ref().len() as u64 - reader.position();
+                if remaining < entry_width as u64 {
+                    break;
+                }
                 let entry_type = if !bytes1.is_empty() {
                     read_big_endian_integer(&mut reader, bytes1.as_mut_slice())?
                 } else {
@@ -650,10 +704,12 @@ pub fn decode_xref_stream_with_limit(
                 };
                 let entry = match entry_type {
                     0 => {
-                        // free object
+                        // free object: keep the entry so it shadows an older
+                        // live object in /Prev instead of resurrecting it.
                         read_big_endian_integer(&mut reader, bytes2.as_mut_slice())?;
-                        read_big_endian_integer(&mut reader, bytes3.as_mut_slice())?;
-                        Some(XrefEntry::Free)
+                        let generation =
+                            read_big_endian_integer(&mut reader, bytes3.as_mut_slice())? as u16;
+                        Some(XrefEntry::Free { generation })
                     }
                     1 => {
                         // normal object
@@ -667,8 +723,10 @@ pub fn decode_xref_stream_with_limit(
                     }
                     2 => {
                         // compressed object
-                        let container = read_big_endian_integer(&mut reader, bytes2.as_mut_slice())?;
-                        let index = read_big_endian_integer(&mut reader, bytes3.as_mut_slice())? as u16;
+                        let container =
+                            read_big_endian_integer(&mut reader, bytes2.as_mut_slice())?;
+                        let index =
+                            read_big_endian_integer(&mut reader, bytes3.as_mut_slice())? as u16;
                         Some(XrefEntry::Compressed { container, index })
                     }
                     _ => {
@@ -779,40 +837,6 @@ mod tests {
         assert_eq!(extracted_text.unwrap(), format!("{text1}\n{text2}\n"));
     }
 
-    /// ISO 32000-1 §9.7.5.2 — the codes of a Type 0 font whose `/Encoding` is a
-    /// predefined Unicode CMap (here `UniJIS-UCS2-H`) are UCS-2 values, so
-    /// the text can be extracted without a `/ToUnicode` CMap.
-    #[test]
-    fn extract_text_decodes_type0_font_with_predefined_unicode_cmap() {
-        use crate::content::Operation;
-        use crate::creator::tests::create_document_with_operations;
-        use crate::{Object, StringFormat};
-
-        let mut doc = create_document_with_operations(vec![
-            Operation::new("BT", vec![]),
-            Operation::new("Tf", vec!["F1".into(), 12.into()]),
-            Operation::new("Td", vec![100.into(), 700.into()]),
-            Operation::new(
-                "Tj",
-                vec![Object::String(vec![0x65, 0xE5, 0x67, 0x2C], StringFormat::Hexadecimal)],
-            ),
-            Operation::new("ET", vec![]),
-        ]);
-        let font_id = doc
-            .objects
-            .iter()
-            .find(|(_, obj)| obj.as_dict().map(|d| d.has_type(b"Font")).unwrap_or(false))
-            .map(|(id, _)| *id)
-            .expect("font object exists");
-        let font = doc.get_object_mut(font_id).and_then(Object::as_dict_mut).unwrap();
-        font.set("Subtype", "Type0");
-        font.set("BaseFont", "KozMinPr6N-Regular");
-        font.set("Encoding", "UniJIS-UCS2-H");
-
-        let text = doc.extract_text(&[1]).unwrap();
-        assert_eq!(text.trim(), "日本");
-    }
-
     const BOMB_MIB: usize = 1024 * 1024;
 
     /// A FlateDecode-compressed stream that inflates to `target` zero-bytes, built
@@ -844,8 +868,10 @@ mod tests {
         let content_id = doc.get_page_contents(page_id)[0];
         let mut dict = Dictionary::new();
         dict.set("Filter", "FlateDecode");
-        doc.objects
-            .insert(content_id, Object::Stream(Stream::new(dict, flate_bomb(target))));
+        doc.objects.insert(
+            content_id,
+            Object::Stream(Stream::new(dict, flate_bomb(target))),
+        );
         doc
     }
 
@@ -866,9 +892,15 @@ mod tests {
 
         let mut tounicode_dict = Dictionary::new();
         tounicode_dict.set("Filter", "FlateDecode");
-        let tounicode_id = doc.add_object(Object::Stream(Stream::new(tounicode_dict, flate_bomb(target))));
+        let tounicode_id = doc.add_object(Object::Stream(Stream::new(
+            tounicode_dict,
+            flate_bomb(target),
+        )));
 
-        let font = doc.get_object_mut(font_id).and_then(Object::as_dict_mut).unwrap();
+        let font = doc
+            .get_object_mut(font_id)
+            .and_then(Object::as_dict_mut)
+            .unwrap();
         font.set("ToUnicode", Object::Reference(tounicode_id));
         doc
     }
@@ -876,7 +908,7 @@ mod tests {
     use crate::creator::tests::create_document_with_texts;
 
     /// Under a generous limit, `extract_text_with_limit` returns exactly the same
-    /// text as `extract_text`.
+    /// text as the unbounded `extract_text`.
     #[test]
     fn extract_text_with_limit_matches_unbounded_under_limit() {
         use crate::creator::tests::create_document_with_texts;
@@ -898,7 +930,10 @@ mod tests {
 
         let doc = doc_with_page_content_bomb(32 * BOMB_MIB);
 
-        match doc.extract_text_with_limit(&[1], 4 * BOMB_MIB).map(|s| s.len()) {
+        match doc
+            .extract_text_with_limit(&[1], 4 * BOMB_MIB)
+            .map(|s| s.len())
+        {
             Err(Error::Decompress(DecompressError::MemoryLimitExceeded { limit })) => {
                 assert_eq!(limit, 4 * BOMB_MIB);
             }
@@ -918,7 +953,9 @@ mod tests {
         assert!(
             chunks.iter().any(|chunk| matches!(
                 chunk,
-                Err(Error::Decompress(DecompressError::MemoryLimitExceeded { .. }))
+                Err(Error::Decompress(
+                    DecompressError::MemoryLimitExceeded { .. }
+                ))
             )),
             "expected a MemoryLimitExceeded error chunk"
         );
@@ -933,47 +970,15 @@ mod tests {
 
         let doc = doc_with_tounicode_font_bomb(32 * BOMB_MIB);
 
-        match doc.extract_text_with_limit(&[1], 4 * BOMB_MIB).map(|s| s.len()) {
+        match doc
+            .extract_text_with_limit(&[1], 4 * BOMB_MIB)
+            .map(|s| s.len())
+        {
             Err(Error::Decompress(DecompressError::MemoryLimitExceeded { limit })) => {
                 assert_eq!(limit, 4 * BOMB_MIB);
             }
             other => panic!("expected MemoryLimitExceeded from ToUnicode font bomb, got {other:?}"),
         }
-    }
-
-    /// `extract_text` bounds page content by `DEFAULT_MAX_DECOMPRESSED_SIZE` without
-    /// the caller opting in, so a bomb just over the default is rejected.
-    #[test]
-    fn extract_text_rejects_page_content_bomb_by_default() {
-        use crate::{DEFAULT_MAX_DECOMPRESSED_SIZE, DecompressError, Error};
-
-        let doc = doc_with_page_content_bomb(DEFAULT_MAX_DECOMPRESSED_SIZE + BOMB_MIB);
-
-        match doc.extract_text(&[1]).map(|s| s.len()) {
-            Err(Error::Decompress(DecompressError::MemoryLimitExceeded { limit })) => {
-                assert_eq!(limit, DEFAULT_MAX_DECOMPRESSED_SIZE);
-            }
-            other => panic!("expected MemoryLimitExceeded at the default limit, got {other:?}"),
-        }
-    }
-
-    /// `extract_text_chunks` applies the same default bound and reports it as an
-    /// `Err` chunk.
-    #[test]
-    fn extract_text_chunks_rejects_page_content_bomb_by_default() {
-        use crate::{DEFAULT_MAX_DECOMPRESSED_SIZE, DecompressError, Error};
-
-        let doc = doc_with_page_content_bomb(DEFAULT_MAX_DECOMPRESSED_SIZE + BOMB_MIB);
-        let chunks = doc.extract_text_chunks(&[1]);
-
-        assert!(
-            chunks.iter().any(|chunk| matches!(
-                chunk,
-                Err(Error::Decompress(DecompressError::MemoryLimitExceeded { limit }))
-                    if *limit == DEFAULT_MAX_DECOMPRESSED_SIZE
-            )),
-            "expected a MemoryLimitExceeded error chunk at the default limit"
-        );
     }
 
     #[test]
@@ -1027,12 +1032,18 @@ mod tests {
             Operation::new("BT", vec![]),
             Operation::new("Tf", vec!["F1".into(), 12.into()]),
             Operation::new("Td", vec![100.into(), 700.into()]),
-            Operation::new("\"", vec![0.into(), 0.into(), Object::string_literal("from-quote-op")]),
+            Operation::new(
+                "\"",
+                vec![0.into(), 0.into(), Object::string_literal("from-quote-op")],
+            ),
             Operation::new("ET", vec![]),
         ]);
 
         let text = doc.extract_text(&[1]).unwrap();
-        assert!(text.contains("from-quote-op"), "\" string operand lost: {text:?}");
+        assert!(
+            text.contains("from-quote-op"),
+            "\" string operand lost: {text:?}"
+        );
     }
 
     /// PDF 1.7 / ISO 32000-1 §9.4.2 — `T*` moves to the start of the
@@ -1065,207 +1076,6 @@ mod tests {
             "T* did not insert a line break between Tj strings: between={between:?}"
         );
     }
-
-    /// A ToUnicode CMap with one codespace range and the given `bfchar` lines.
-    fn to_unicode_cmap(codespace: &str, bfchar: &[&str]) -> Vec<u8> {
-        format!(
-            "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
-             /CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n\
-             1 begincodespacerange\n{codespace}\nendcodespacerange\n\
-             {} beginbfchar\n{}\nendbfchar\n\
-             endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n",
-            bfchar.len(),
-            bfchar.join("\n")
-        )
-        .into_bytes()
-    }
-
-    /// A one-page document that shows `shown` with a TrueType font whose `/Encoding` is
-    /// `/WinAnsiEncoding` and whose `/ToUnicode` stream (if any) has the given content.
-    fn doc_with_simple_font(shown: &[u8], to_unicode: Option<Vec<u8>>) -> crate::Document {
-        use crate::content::Operation;
-        use crate::creator::tests::create_document_with_operations;
-        use crate::{Dictionary, Object, Stream};
-
-        let mut doc = create_document_with_operations(vec![
-            Operation::new("BT", vec![]),
-            Operation::new("Tf", vec!["F1".into(), 12.into()]),
-            Operation::new("Td", vec![100.into(), 700.into()]),
-            Operation::new("Tj", vec![Object::string_literal(shown)]),
-            Operation::new("ET", vec![]),
-        ]);
-        let font_id = doc
-            .objects
-            .iter()
-            .find(|(_, obj)| obj.as_dict().map(|d| d.has_type(b"Font")).unwrap_or(false))
-            .map(|(id, _)| *id)
-            .expect("font object exists");
-        let to_unicode_id = to_unicode.map(|content| doc.add_object(Stream::new(Dictionary::new(), content)));
-        let font = doc.get_object_mut(font_id).and_then(Object::as_dict_mut).unwrap();
-        font.set("Subtype", "TrueType");
-        font.set("BaseFont", "Arial");
-        font.set("Encoding", "WinAnsiEncoding");
-        if let Some(id) = to_unicode_id {
-            font.set("ToUnicode", id);
-        }
-        doc
-    }
-
-    /// ISO 32000-1 §9.10.2 — `/ToUnicode` is the first method for mapping a code to
-    /// Unicode, so it wins over `/Encoding`. A code the CMap leaves out still comes
-    /// from `/Encoding`.
-    #[test]
-    fn extract_text_prefers_tounicode_over_encoding() {
-        let cmap = to_unicode_cmap("<00> <FF>", &["<41> <3042>"]);
-        let doc = doc_with_simple_font(b"AB", Some(cmap));
-
-        assert_eq!(doc.extract_text(&[1]).unwrap().trim(), "\u{3042}B");
-    }
-
-    /// A simple font's codes are one byte each, even when its ToUnicode CMap is written
-    /// with a two-byte codespace and two-byte keys, as many producers do.
-    #[test]
-    fn extract_text_reads_simple_font_tounicode_with_two_byte_codespace() {
-        let cmap = to_unicode_cmap("<0000> <FFFF>", &["<0041> <0391>", "<42> <0392>"]);
-        let doc = doc_with_simple_font(b"AB", Some(cmap));
-
-        assert_eq!(doc.extract_text(&[1]).unwrap().trim(), "\u{0391}\u{0392}");
-    }
-
-    /// A ToUnicode CMap that cannot be parsed falls back to `/Encoding`, not to
-    /// StandardEncoding (where 0xE9 would be "Ø").
-    #[test]
-    fn extract_text_falls_back_to_encoding_when_tounicode_is_unparsable() {
-        let broken = b"1 beginbfrange\n<05> <01> <0041>\nendbfrange\n".to_vec();
-        assert!(crate::encodings::cmap::ToUnicodeCMap::parse(broken.clone()).is_err());
-        let doc = doc_with_simple_font(b"caf\xE9", Some(broken));
-
-        assert_eq!(doc.extract_text(&[1]).unwrap().trim(), "caf\u{e9}");
-    }
-
-    /// Text replaced in a simple font that has a ToUnicode CMap is written back as
-    /// one-byte codes, including for characters that only `/Encoding` maps.
-    #[test]
-    fn replace_text_writes_one_byte_codes_for_simple_font_with_tounicode() {
-        let cmap = to_unicode_cmap("<0000> <FFFF>", &["<0041> <3042>"]);
-        let mut doc = doc_with_simple_font(b"AB", Some(cmap));
-
-        doc.replace_text(1, "\u{3042}B", "B\u{3042}", None).unwrap();
-
-        assert_eq!(doc.extract_text(&[1]).unwrap().trim(), "B\u{3042}");
-        let page_id = doc.page_iter().next().unwrap();
-        let content = doc.get_and_decode_page_content(page_id).unwrap();
-        let shown = content.operations.iter().find(|op| op.operator == "Tj").unwrap();
-        assert_eq!(shown.operands[0].as_str().unwrap(), b"BA");
-    }
-
-    /// A decompression bomb in `/ToUnicode` still surfaces when the font also has
-    /// `/Encoding`, now that `/ToUnicode` is read first.
-    #[test]
-    fn extract_text_with_limit_rejects_tounicode_bomb_in_font_with_encoding() {
-        use crate::{DecompressError, Error, Object};
-
-        let mut doc = doc_with_tounicode_font_bomb(32 * BOMB_MIB);
-        let font_id = doc
-            .objects
-            .iter()
-            .find(|(_, obj)| obj.as_dict().map(|d| d.has_type(b"Font")).unwrap_or(false))
-            .map(|(id, _)| *id)
-            .expect("font object exists");
-        let font = doc.get_object_mut(font_id).and_then(Object::as_dict_mut).unwrap();
-        font.set("Encoding", "WinAnsiEncoding");
-
-        match doc.extract_text_with_limit(&[1], 4 * BOMB_MIB).map(|s| s.len()) {
-            Err(Error::Decompress(DecompressError::MemoryLimitExceeded { limit })) => {
-                assert_eq!(limit, 4 * BOMB_MIB);
-            }
-            other => panic!("expected MemoryLimitExceeded from ToUnicode font bomb, got {other:?}"),
-        }
-    }
-
-    /// A one-page document that shows the two-byte codes `<0001><0002>` with a Type 0
-    /// font whose `/Encoding` is made by `encoding` and whose ToUnicode CMap maps codes
-    /// 1, 2 and 3 to "한", "글" and "A".
-    fn doc_with_type0_font(encoding: &dyn Fn(&mut crate::Document) -> crate::Object) -> crate::Document {
-        use crate::content::Operation;
-        use crate::creator::tests::create_document_with_operations;
-        use crate::{Dictionary, Object, Stream, StringFormat};
-
-        let mut doc = create_document_with_operations(vec![
-            Operation::new("BT", vec![]),
-            Operation::new("Tf", vec!["F1".into(), 12.into()]),
-            Operation::new("Td", vec![100.into(), 700.into()]),
-            Operation::new(
-                "Tj",
-                vec![Object::String(vec![0x00, 0x01, 0x00, 0x02], StringFormat::Hexadecimal)],
-            ),
-            Operation::new("ET", vec![]),
-        ]);
-        let font_id = doc
-            .objects
-            .iter()
-            .find(|(_, obj)| obj.as_dict().map(|d| d.has_type(b"Font")).unwrap_or(false))
-            .map(|(id, _)| *id)
-            .expect("font object exists");
-        let cmap = to_unicode_cmap("<0000> <FFFF>", &["<0001> <D55C>", "<0002> <AE00>", "<0003> <0041>"]);
-        let to_unicode_id = doc.add_object(Stream::new(Dictionary::new(), cmap));
-        let encoding = encoding(&mut doc);
-        let font = doc.get_object_mut(font_id).and_then(Object::as_dict_mut).unwrap();
-        font.set("Subtype", "Type0");
-        font.set("BaseFont", "NotoSansCJK-Regular");
-        font.set("Encoding", encoding);
-        font.set("ToUnicode", to_unicode_id);
-        doc
-    }
-
-    /// The bytes of the first `Tj` string on page 1.
-    fn shown_bytes(doc: &crate::Document) -> Vec<u8> {
-        let page_id = doc.page_iter().next().unwrap();
-        let content = doc.get_and_decode_page_content(page_id).unwrap();
-        let shown = content.operations.iter().find(|op| op.operator == "Tj").unwrap();
-        shown.operands[0].as_str().unwrap().to_vec()
-    }
-
-    /// Text replaced in a Type 0 font is written as the two-byte codes of its ToUnicode
-    /// CMap, without a byte order mark, and reads back as the replacement.
-    fn assert_type0_replacement_uses_tounicode_codes(encoding: &dyn Fn(&mut crate::Document) -> crate::Object) {
-        let mut doc = doc_with_type0_font(encoding);
-        assert_eq!(doc.extract_text(&[1]).unwrap().trim(), "한글");
-
-        doc.replace_text(1, "한글", "글A한", None).unwrap();
-        assert_eq!(shown_bytes(&doc), [0x00, 0x02, 0x00, 0x03, 0x00, 0x01]);
-        assert_eq!(doc.extract_text(&[1]).unwrap().trim(), "글A한");
-
-        let mut doc = doc_with_type0_font(encoding);
-        assert_eq!(doc.replace_partial_text(1, "한", "A글", None).unwrap(), 1);
-        assert_eq!(shown_bytes(&doc), [0x00, 0x03, 0x00, 0x02, 0x00, 0x02]);
-        assert_eq!(doc.extract_text(&[1]).unwrap().trim(), "A글글");
-    }
-
-    #[test]
-    fn replace_text_writes_tounicode_codes_for_type0_font_with_predefined_cmap() {
-        for name in ["UniKS-UCS2-H", "UniGB-UCS2-H"] {
-            assert_type0_replacement_uses_tounicode_codes(&|_| crate::Object::Name(name.into()));
-        }
-    }
-
-    #[test]
-    fn replace_text_writes_tounicode_codes_for_type0_font_with_embedded_cmap() {
-        use crate::{Object, Stream};
-
-        let cmap = b"/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
-            /CMapName /Custom-H def\n/CMapType 1 def\n\
-            1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n\
-            1 begincidrange\n<0000> <FFFF> 0\nendcidrange\n\
-            endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n";
-        assert_type0_replacement_uses_tounicode_codes(&|doc| {
-            let stream = Stream::new(
-                dictionary! { "Type" => "CMap", "CMapName" => "Custom-H" },
-                cmap.to_vec(),
-            );
-            Object::Reference(doc.add_object(stream))
-        });
-    }
 }
 
 #[cfg(test)]
@@ -1282,7 +1092,10 @@ mod encode_equivalence_tests {
         assert_eq!(encode(&encoding, "A", "?"), vec![b'A']);
         assert_eq!(encode(&encoding, "AB", "?"), vec![b'A', b'B']);
         // An unmappable character falls back per character.
-        assert_eq!(encode(&encoding, "A\u{1F600}B", "?"), vec![b'A', b'?', b'B']);
+        assert_eq!(
+            encode(&encoding, "A\u{1F600}B", "?"),
+            vec![b'A', b'?', b'B']
+        );
         // The empty string yields no bytes of its own.
         assert_eq!(encode(&encoding, "", "?"), vec![b'?']);
     }

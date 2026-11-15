@@ -1,5 +1,4 @@
 use crate::parser;
-use crate::writer::{Style, Writer};
 use crate::{Document, Error, Object, ObjectId, Result, Stream};
 use std::collections::BTreeMap;
 use std::num::TryFromIntError;
@@ -9,17 +8,14 @@ use log::warn;
 #[cfg(feature = "rayon")]
 use rayon::prelude::*;
 
-/// With the `rayon` feature, an object stream with fewer members is parsed on
-/// the calling thread unless that thread is one of rayon's workers. Outside
-/// the pool, handing a small stream to it costs more than it saves, as for a
-/// small document in `Reader`. Inside, splitting is cheap and lets idle
-/// workers share a stream that the rest of a parallel load waits for.
-#[cfg(feature = "rayon")]
-const MIN_PARALLEL_OBJECTS: usize = 32;
-
 #[derive(Debug)]
 pub struct ObjectStream {
     pub objects: BTreeMap<ObjectId, Object>,
+    /// Members in `/N` index-block order.  A corrupt offset or body leaves
+    /// `None` at that position so a bad xref index cannot select a later
+    /// member (pdfium `CPDF_ObjectStream::ParseObject`,
+    /// cpdf_object_stream.cpp:82-101).
+    members: Vec<Option<(ObjectId, Object)>>,
     max_objects: usize,
     compression_level: u32,
 }
@@ -59,7 +55,10 @@ impl ObjectStream {
     /// Parse an existing object stream without modifying it, rejecting the
     /// decoded content if it would exceed `max_decompressed_size` bytes. `None`
     /// means no limit (the behavior of [`ObjectStream::new`]).
-    pub fn new_with_limit(stream: &Stream, max_decompressed_size: Option<usize>) -> Result<ObjectStream> {
+    pub fn new_with_limit(
+        stream: &Stream,
+        max_decompressed_size: Option<usize>,
+    ) -> Result<ObjectStream> {
         let content = match max_decompressed_size {
             // Object streams are decoded while the document is loaded, so
             // enforcing the limit here bounds the memory a single stream can use.
@@ -70,6 +69,7 @@ impl ObjectStream {
         if content.is_empty() {
             return Ok(ObjectStream {
                 objects: BTreeMap::new(),
+                members: Vec::new(),
                 max_objects: 100,
                 compression_level: 6,
             });
@@ -81,21 +81,31 @@ impl ObjectStream {
             .and_then(Object::as_i64)?
             .try_into()
             .map_err(|e: TryFromIntError| Error::NumericCast(e.to_string()))?;
-        let index_block = content.get(..first_offset).ok_or(Error::InvalidOffset(first_offset))?;
+        let index_block = content
+            .get(..first_offset)
+            .ok_or(Error::InvalidOffset(first_offset))?;
 
-        let numbers_str = std::str::from_utf8(index_block).map_err(|e| Error::InvalidObjectStream(e.to_string()))?;
-        // A comment is white space, and runs to the end of its line.
+        let numbers_str = std::str::from_utf8(index_block)
+            .map_err(|e| Error::InvalidObjectStream(e.to_string()))?;
         let numbers: Vec<_> = numbers_str
-            .split(['\r', '\n'])
-            .flat_map(|line| line.split('%').next().unwrap_or_default().split_whitespace())
+            .split_whitespace()
             .map(|number| u32::from_str(number).ok())
             .collect();
-        let len = numbers.len() / 2 * 2; // Ensure only pairs.
-
         let n = stream.dict.get(b"N").and_then(Object::as_i64)?;
         if numbers.len().try_into().ok() != n.checked_mul(2) {
             warn!("object stream: the object stream dictionary specifies a wrong number of objects")
         }
+        // Only the first `/N` index pairs are addressable: pdfium registers
+        // exactly `N` entries and stops when the data ends
+        // (`CPDF_ObjectStream::Init`, cpdf_object_stream.cpp:104-120), so a
+        // pair past a smaller `/N` must not answer any cross-reference index.
+        // A negative `/N` makes the stream invalid and yields no members.
+        let declared_pairs = if n < 0 {
+            0
+        } else {
+            usize::try_from(n).unwrap_or(usize::MAX)
+        };
+        let len = (numbers.len() / 2).min(declared_pairs) * 2; // Whole pairs, capped by /N.
 
         let chunks_filter_map = |chunk: &[_]| {
             let id = chunk[0]?;
@@ -105,31 +115,57 @@ impl ObjectStream {
                 warn!("out-of-bounds offset in object stream");
                 return None;
             }
-            // Skip white space and comments before the object, such as the newlines some PDFs
-            // emit there and the comment that qpdf writes in QDF files.
-            let (rest, ()) = parser::space(&content[offset..]).ok()?;
-            if rest.is_empty() {
+            // Skip leading whitespace — some PDFs emit newlines before objects in ObjStm
+            let mut start = offset;
+            while start < content.len() && content[start].is_ascii_whitespace() {
+                start += 1;
+            }
+            if start >= content.len() {
                 warn!("only whitespace after offset in object stream");
                 return None;
             }
-            let object = parser::direct_object(rest)?;
+            let object = parser::direct_object(&content[start..])?;
 
             Some(((id, 0), object))
         };
         #[cfg(feature = "rayon")]
-        let objects = if len / 2 >= MIN_PARALLEL_OBJECTS || rayon::current_thread_index().is_some() {
-            numbers[..len].par_chunks(2).filter_map(chunks_filter_map).collect()
-        } else {
-            numbers[..len].chunks(2).filter_map(chunks_filter_map).collect()
-        };
+        let members: Vec<Option<(ObjectId, Object)>> = numbers[..len]
+            .par_chunks(2)
+            .map(chunks_filter_map)
+            .collect();
         #[cfg(not(feature = "rayon"))]
-        let objects = numbers[..len].chunks(2).filter_map(chunks_filter_map).collect();
+        let members: Vec<Option<(ObjectId, Object)>> =
+            numbers[..len].chunks(2).map(chunks_filter_map).collect();
+        let objects = members
+            .iter()
+            .flatten()
+            .map(|(id, object)| (*id, object.clone()))
+            .collect();
 
         Ok(ObjectStream {
             objects,
+            members,
             max_objects: 100,
             compression_level: 6,
         })
+    }
+
+    /// The member at the declared xref index, with the object number stored
+    /// in the index block.  Callers must compare that number with the
+    /// requested one; the position alone is not an identity.
+    pub fn member_at(&self, index: usize) -> Option<(ObjectId, &Object)> {
+        self.members
+            .get(index)
+            .and_then(|member| member.as_ref())
+            .map(|(id, object)| (*id, object))
+    }
+
+    /// Consume the stream and return its members in declared-index order,
+    /// including the holes left by unparsable entries.  The position in the
+    /// slice is the cross-reference index; bulk loaders must keep it to honour
+    /// the same identity check as [`Self::member_at`].
+    pub(crate) fn into_members(self) -> Vec<Option<(ObjectId, Object)>> {
+        self.members
     }
 
     /// Create a builder for constructing new object streams
@@ -170,12 +206,12 @@ impl ObjectStream {
     /// stream stores them sorted, and both the offset table and the body walk
     /// them in that order. The order comes from [`Self::sorted_object_ids`], so
     /// the body and the cross-reference indices cannot drift apart.
-    fn sorted_serializations(&self, style: Style) -> Result<Vec<(ObjectId, Vec<u8>)>> {
+    fn sorted_serializations(&self) -> Result<Vec<(ObjectId, Vec<u8>)>> {
         self.sorted_object_ids()
             .into_iter()
             .map(|id| {
                 let mut bytes = Vec::new();
-                Writer::write_styled_object(&mut bytes, &self.objects[&id], style)?;
+                crate::writer::Writer::write_object(&mut bytes, &self.objects[&id])?;
                 Ok((id, bytes))
             })
             .collect()
@@ -210,19 +246,19 @@ impl ObjectStream {
 
     /// Build the stream content in the format required by PDF spec
     pub fn build_stream_content(&self) -> Result<Vec<u8>> {
-        self.build_body(Style::default()).map(|(content, _)| content)
+        self.build_body().map(|(content, _)| content)
     }
 
     /// The object stream body — the offset table followed by the serialized
     /// objects — together with the `/First` offset, which is where the table
     /// ends. Both are needed to build the stream, so they are produced together
     /// rather than by serializing the members twice.
-    fn build_body(&self, style: Style) -> Result<(Vec<u8>, usize)> {
+    fn build_body(&self) -> Result<(Vec<u8>, usize)> {
         if self.objects.is_empty() {
             return Ok((Vec::new(), 0));
         }
 
-        let members = self.sorted_serializations(style)?;
+        let members = self.sorted_serializations()?;
         let table = Self::offset_table(&members);
         let first_offset = table.len();
 
@@ -239,14 +275,7 @@ impl ObjectStream {
 
     /// Convert to a Stream object ready for insertion into a PDF
     pub fn to_stream_object(&self) -> Result<Stream> {
-        self.to_styled_stream_object(Style::default())
-    }
-
-    /// [`Self::to_stream_object`] with the members serialized in the layout that `style` asks
-    /// for, as a save with [`crate::SaveOptions::ascii`] or [`crate::SaveOptions::pretty`]
-    /// writes them.
-    pub(crate) fn to_styled_stream_object(&self, style: Style) -> Result<Stream> {
-        let (content, first_offset) = self.build_body(style)?;
+        let (content, first_offset) = self.build_body()?;
 
         let dict = dictionary! {
             "Type" => "ObjStm",
@@ -342,6 +371,7 @@ impl ObjectStreamBuilder {
     pub fn build(self) -> ObjectStream {
         ObjectStream {
             objects: BTreeMap::new(),
+            members: Vec::new(),
             max_objects: self.max_objects,
             compression_level: self.compression_level,
         }

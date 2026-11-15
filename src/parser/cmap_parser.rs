@@ -1,13 +1,18 @@
-use crate::cmap_section::{ArrayOfTargetStrings, CMapParseError, CMapSection, CodeLen, SourceCode, SourceRangeMapping};
-use crate::parser::{NomResult, ParserInput, comment, dict_dup, dictionary, eol, hex_char, name};
+use crate::cmap_section::{
+    ArrayOfTargetStrings, CMapParseError, CMapSection, CodeLen, SourceCode, SourceRangeMapping,
+};
+use crate::parser::{NomResult, ParserInput, comment, eol, hex_char};
+#[cfg(test)]
+use crate::parser::{dict_dup, dictionary, name};
 use nom::Parser;
 use nom::branch::alt;
 pub use nom::bytes::complete::tag;
 use nom::combinator::{map, opt};
 use nom::error::ParseError;
-use nom::multi::{fold_many_m_n, fold_many0, fold_many1, many_m_n, many0, many1, separated_list1};
-use nom::sequence::{pair, preceded, separated_pair, terminated};
+use nom::multi::{fold_many0, fold_many1, many_m_n, separated_list1};
+use nom::sequence::{pair, separated_pair, terminated};
 use nom::{character::complete::digit1, sequence::delimited};
+use std::str;
 
 impl<E> From<nom::Err<E>> for CMapParseError {
     fn from(err: nom::Err<E>) -> Self {
@@ -20,27 +25,43 @@ impl<E> From<nom::Err<E>> for CMapParseError {
     }
 }
 
-pub(crate) fn parse(stream_content: ParserInput) -> Result<Vec<CMapSection>, CMapParseError> {
+/// A ToUnicode CMap parsed section by section.
+///
+/// Sections are independent: a malformed `bfchar`/`bfrange` section is dropped
+/// without discarding the sections around it (pdfium `HandleBeginBFChar` /
+/// `HandleBeginBFRange`, cpdf_tounicodemap.cpp:180-259).  `usecmap` names the
+/// predefined Adobe collection a miss falls back to (pdfium
+/// cpdf_tounicodemap.cpp:154-173).
+#[derive(Debug, Default)]
+pub(crate) struct ParsedCMap {
+    pub sections: Vec<CMapSection>,
+    pub usecmap: Option<Vec<u8>>,
+}
+
+pub(crate) fn parse(stream_content: ParserInput) -> Result<ParsedCMap, CMapParseError> {
     let result = cmap_stream(stream_content);
     let result = result.map_err(CMapParseError::from)?;
     Ok(result.1)
 }
 
-fn cmap_stream(input: ParserInput) -> NomResult<Vec<CMapSection>> {
+fn cmap_stream(input: ParserInput) -> NomResult<ParsedCMap> {
     delimited(
         cidinit_procset,
         cmap_resource_dictionary,
-        (tag(&b"end"[..]), multispace0),
+        // The trailing `end` is optional: producers truncate CMap streams
+        // mid-token (issue20930's ToUnicode ends at "CMapT"), and pdf.js's
+        // incremental parser keeps every entry parsed before the cut.
+        opt((tag(&b"end"[..]), multispace0)),
     )
     .parse(input)
 }
 
 fn space0(input: ParserInput) -> NomResult<()> {
-    fold_many0(alt((tag(&b" "[..]), tag("\t"))), || {}, |_, _| ()).parse(input)
+    fold_many0(alt((tag(&b" "[..]), tag("\t"), eol)), || {}, |_, _| ()).parse(input)
 }
 
 fn space1(input: ParserInput) -> NomResult<()> {
-    fold_many1(alt((tag(&b" "[..]), tag("\t"))), || {}, |_, _| ()).parse(input)
+    fold_many1(alt((tag(&b" "[..]), tag("\t"), eol)), || {}, |_, _| ()).parse(input)
 }
 
 fn multispace0(input: ParserInput) -> NomResult<()> {
@@ -74,8 +95,8 @@ fn cidinit_procset(input: ParserInput) -> NomResult<()> {
         .map(|(i, _)| (i, ()))
 }
 
-fn cmap_resource_dictionary(input: ParserInput) -> NomResult<Vec<CMapSection>> {
-    let begin_parser = (
+fn cmap_resource_dictionary(input: ParserInput) -> NomResult<ParsedCMap> {
+    let mut begin_parser = (
         digit1,
         space1,
         tag(&b"dict"[..]),
@@ -83,53 +104,145 @@ fn cmap_resource_dictionary(input: ParserInput) -> NomResult<Vec<CMapSection>> {
         tag(&b"begin"[..]),
         multispace1,
     );
-    let end_parser = (tag(&b"end"[..]), multispace1);
-    delimited(begin_parser, cmap_data, end_parser).parse(input)
+    let mut begin_cmap = (tag(&b"begincmap"[..]), multispace1);
+    let (rest, _) = begin_parser.parse(input)?;
+    let (rest, _) = begin_cmap.parse(rest)?;
+    let (rest, parsed) = cmap_data(rest)?;
+    // pdf.js and pdfium stop reading at `endcmap`; the epilogue after it
+    // varies in shape (issue20930 reorders `CMapType` before `currentdict`
+    // and omits `CMapName`; pdfapi2 misspells `currentdict`), so it is
+    // skipped word-wise instead of validated.
+    let mut rest = rest;
+    loop {
+        let (after_space, _) = multispace0(rest)?;
+        if after_space.is_empty() {
+            rest = after_space;
+            break;
+        }
+        match next_token(after_space) {
+            Ok((after_token, _)) => rest = after_token,
+            Err(_) => break,
+        }
+    }
+    Ok((rest, parsed))
 }
 
-fn cmap_data(input: ParserInput) -> NomResult<Vec<CMapSection>> {
-    let cmap_end = (
-        tag(&b"endcmap"[..]),
-        multispace1,
-        tag(&b"CMapName"[..]),
-        space1,
-        tag(&b"currentdict"[..]),
-        space0,
-        tag(&b"/CMap"[..]),
-        space1,
-        tag(&b"defineresource"[..]),
-        space1,
-        tag(&b"pop"[..]),
-        multispace1,
-    );
-    delimited(
-        (tag(&b"begincmap"[..]), multispace1),
-        preceded(cmap_metadata, cmap_codespace_and_mappings),
-        cmap_end,
-    )
-    .parse(input)
+/// Scan CMap body tokens until `endcmap`, keeping every section that parses
+/// completely.  Unknown tokens (metadata, `def`, dictionaries, `usecmap`) are
+/// skipped one word at a time, matching pdfium's word-based parser
+/// (cpdf_tounicodemap.cpp:145-172).
+fn cmap_data(input: ParserInput) -> NomResult<ParsedCMap> {
+    let mut rest = input;
+    let mut sections = Vec::new();
+    let mut usecmap = None;
+    let mut previous_name: Option<Vec<u8>> = None;
+    loop {
+        let (after_space, _) = multispace0(rest)?;
+        rest = after_space;
+        if rest.is_empty() {
+            return Err(nom::Err::Failure(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::Eof,
+            )));
+        }
+        if rest.starts_with(b"endcmap") {
+            return Ok((rest, ParsedCMap { sections, usecmap }));
+        }
+        if let Some((after_section, section)) = try_section(rest) {
+            sections.push(section);
+            rest = after_section;
+            previous_name = None;
+            continue;
+        }
+        let (after_token, token) = next_token(rest)?;
+        if token == b"usecmap" {
+            if let Some(name) = previous_name.take() {
+                usecmap = Some(name);
+            }
+        } else if let Some(name) = token.strip_prefix(b"/") {
+            previous_name = Some(name.to_vec());
+        } else {
+            previous_name = None;
+        }
+        rest = after_token;
+    }
 }
 
-fn cmap_metadata(input: ParserInput) -> NomResult<()> {
-    let metadata_parser = alt((
-        cid_system_info,
-        cmap_name,
-        cmap_type,
-        cmap_version,
-        uidoffset,
-        wmode,
-        xuid,
-    ));
-    fold_many_m_n(1, 7, metadata_parser, || (), |_, _| ()).parse(input)
+/// Parse one complete section.  A malformed line drops the whole section,
+/// never part of it; the declared counts are hints, not gates.
+fn try_section(input: ParserInput) -> Option<(ParserInput, CMapSection)> {
+    alt((codespace_range_section, bf_char_section, bf_range_section))
+        .parse(input)
+        .ok()
 }
 
+/// Read one token for the tolerant scanner.  The returned slice borrows from
+/// the input and includes the `/` of a name.
+fn next_token<'a>(input: ParserInput<'a>) -> NomResult<'a, &'a [u8]> {
+    let first = *input.first().ok_or_else(|| {
+        nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Eof))
+    })?;
+    let end = match first {
+        b'<' if input.starts_with(b"<<") => 2,
+        b'<' => input
+            .iter()
+            .position(|byte| *byte == b'>')
+            .map(|index| index + 1)
+            .unwrap_or(input.len()),
+        b'(' => {
+            let mut depth = 0usize;
+            let mut index = 0usize;
+            let mut escaped = false;
+            while index < input.len() {
+                let byte = input[index];
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'(' {
+                    depth += 1;
+                } else if byte == b')' {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        index += 1;
+                        break;
+                    }
+                }
+                index += 1;
+            }
+            index.max(1)
+        }
+        b'/' => input[1..]
+            .iter()
+            .position(|byte| is_token_delimiter(*byte) || byte.is_ascii_whitespace())
+            .map(|index| index + 1)
+            .unwrap_or(input.len()),
+        b'>' | b']' | b'}' | b'{' | b'[' => 1,
+        _ => input
+            .iter()
+            .position(|byte| is_token_delimiter(*byte) || byte.is_ascii_whitespace())
+            .unwrap_or(input.len())
+            .max(1),
+    };
+    let (token, rest) = input.split_at(end.min(input.len()));
+    Ok((rest, token))
+}
+
+fn is_token_delimiter(byte: u8) -> bool {
+    b"()<>[]{}/%".contains(&byte)
+}
+
+#[cfg(test)]
 fn cid_system_info(input: ParserInput) -> NomResult<()> {
     // Note: Can array of CIDSystemInfo occur here?
     // Normally in cmap this can be an array, but can it be also if this is a ToUnicode cmap?
     (
         tag(&b"/CIDSystemInfo"[..]),
         multispace0,
-        alt((terminated(dictionary, multispace0), terminated(dict_dup, multispace1))),
+        alt((
+            terminated(dictionary, multispace0),
+            terminated(dict_dup, multispace1),
+        )),
         tag(&b"def"[..]),
         multispace1,
     )
@@ -137,6 +250,7 @@ fn cid_system_info(input: ParserInput) -> NomResult<()> {
         .map(|(i, _)| (i, ()))
 }
 
+#[cfg(test)]
 fn cmap_name(input: ParserInput) -> NomResult<()> {
     (
         tag(&b"/CMapName"[..]),
@@ -150,6 +264,7 @@ fn cmap_name(input: ParserInput) -> NomResult<()> {
         .map(|(i, _)| (i, ()))
 }
 
+#[cfg(test)]
 fn cmap_type(input: ParserInput) -> NomResult<()> {
     (
         tag(&b"/CMapType"[..]),
@@ -163,6 +278,7 @@ fn cmap_type(input: ParserInput) -> NomResult<()> {
         .map(|(i, _)| (i, ()))
 }
 
+#[cfg(test)]
 fn cmap_version(input: ParserInput) -> NomResult<()> {
     let version = (digit1, opt((tag(&b"."[..]), digit1)));
     (
@@ -177,6 +293,7 @@ fn cmap_version(input: ParserInput) -> NomResult<()> {
         .map(|(i, _)| (i, ()))
 }
 
+#[cfg(test)]
 fn wmode(input: ParserInput) -> NomResult<()> {
     (
         tag(&b"/WMode"[..]),
@@ -190,6 +307,7 @@ fn wmode(input: ParserInput) -> NomResult<()> {
         .map(|(i, _)| (i, ()))
 }
 
+#[cfg(test)]
 fn uidoffset(input: ParserInput) -> NomResult<()> {
     (
         tag(&b"/UIDOffset"[..]),
@@ -203,23 +321,87 @@ fn uidoffset(input: ParserInput) -> NomResult<()> {
         .map(|(i, _)| (i, ()))
 }
 
+#[cfg(test)]
 fn xuid(input: ParserInput) -> NomResult<()> {
-    let array = (tag(&b"["[..]), separated_list1(space1, digit1), tag(&b"]"[..]));
-    (tag(&b"/XUID"[..]), space1, array, space1, tag(&b"def"[..]), multispace1)
+    let array = (
+        tag(&b"["[..]),
+        separated_list1(space1, digit1),
+        tag(&b"]"[..]),
+    );
+    (
+        tag(&b"/XUID"[..]),
+        space1,
+        array,
+        space1,
+        tag(&b"def"[..]),
+        multispace1,
+    )
         .parse(input)
         .map(|(i, _)| (i, ()))
 }
 
-fn cmap_codespace_and_mappings(input: ParserInput) -> NomResult<Vec<CMapSection>> {
-    many1(alt((codespace_range_section, bf_char_section, bf_range_section))).parse(input)
+/// Collect entries until `end`, returning the position after the end keyword.
+/// A malformed entry aborts the whole section so a damaged `bfchar`/`bfrange`
+/// is dropped as a unit (pdfium `HandleBeginBFChar`, cpdf_tounicodemap.cpp:222-232).
+fn collect_entries<'a, T, F>(
+    input: ParserInput<'a>,
+    end: &'static [u8],
+    parse_entry: F,
+) -> NomResult<'a, Vec<T>>
+where
+    F: Fn(ParserInput<'a>) -> NomResult<'a, T>,
+{
+    let mut rest = input;
+    let mut entries = Vec::new();
+    loop {
+        let (after_space, _) = multispace0(rest)?;
+        let at_end = after_space.starts_with(end)
+            && after_space
+                .get(end.len())
+                .is_none_or(|byte| byte.is_ascii_whitespace() || is_token_delimiter(*byte));
+        if at_end {
+            let after_end = &after_space[end.len()..];
+            let (after_end, _) = opt(multispace1).parse(after_end)?;
+            return Ok((after_end, entries));
+        }
+        if after_space.is_empty() {
+            return Err(nom::Err::Failure(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::Eof,
+            )));
+        }
+        let (after_entry, entry) = parse_entry(after_space)?;
+        entries.push(entry);
+        rest = after_entry;
+    }
+}
+
+fn parse_declared_count<'a>(
+    digits: &[u8],
+    input: ParserInput<'a>,
+) -> Result<usize, nom::Err<nom::error::Error<ParserInput<'a>>>> {
+    str::from_utf8(digits)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .ok_or_else(|| {
+            nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Digit))
+        })
 }
 
 fn codespace_range_section(input: ParserInput) -> NomResult<CMapSection> {
-    let begin_section = (digit1, space1, tag(&b"begincodespacerange"[..]), multispace1);
-    let end_section = (tag(&b"endcodespacerange"[..]), multispace1);
-    let parse_range = delimited(space0, code_range_pair, multispace1);
-    let (rest_of_input, ranges_result) = delimited(begin_section, many1(parse_range), end_section).parse(input)?;
-    Ok((rest_of_input, CMapSection::CsRange(ranges_result)))
+    let mut begin_section = (
+        digit1,
+        space1,
+        tag(&b"begincodespacerange"[..]),
+        multispace1,
+    );
+    let (rest, _) = begin_section.parse(input)?;
+    // pdfium ignores the declared codespace count and accepts every valid
+    // pair (cpdf_cmapparser.cpp:112-130); only the pair syntax is gated.
+    let (rest, ranges) = collect_entries(rest, b"endcodespacerange", |input| {
+        delimited(space0, code_range_pair, multispace1).parse(input)
+    })?;
+    Ok((rest, CMapSection::CsRange(ranges)))
 }
 
 fn code_range_pair(input: ParserInput) -> NomResult<(SourceCode, SourceCode, CodeLen)> {
@@ -232,7 +414,9 @@ fn code_range_pair(input: ParserInput) -> NomResult<(SourceCode, SourceCode, Cod
     }
 }
 
-fn create_code_len_err<'a, T, E: ParseError<ParserInput<'a>>>(input: ParserInput<'a>) -> Result<T, nom::Err<E>> {
+fn create_code_len_err<'a, T, E: ParseError<ParserInput<'a>>>(
+    input: ParserInput<'a>,
+) -> Result<T, nom::Err<E>> {
     Err(nom::Err::Failure(nom::error::make_error(
         input,
         nom::error::ErrorKind::LengthValue,
@@ -240,7 +424,8 @@ fn create_code_len_err<'a, T, E: ParseError<ParserInput<'a>>>(input: ParserInput
 }
 
 fn source_code(input: ParserInput) -> NomResult<(SourceCode, CodeLen)> {
-    let (rest_of_input, bytes) = delimited(tag(&b"<"[..]), many_m_n(1, 4, hex_char), tag(&b">"[..])).parse(input)?;
+    let (rest_of_input, bytes) =
+        delimited(tag(&b"<"[..]), many_m_n(1, 4, hex_char), tag(&b">"[..])).parse(input)?;
     let code_len = bytes.len();
     let source_code = bytes
         .into_iter()
@@ -252,17 +437,34 @@ fn source_code(input: ParserInput) -> NomResult<(SourceCode, CodeLen)> {
 }
 
 fn hex_u16(input: ParserInput) -> NomResult<u16> {
-    map(pair(hex_char, hex_char), |(h1, h2)| h1 as u16 * 256 + h2 as u16).parse(input)
+    map(pair(hex_char, hex_char), |(h1, h2)| {
+        h1 as u16 * 256 + h2 as u16
+    })
+    .parse(input)
 }
 
 fn bf_char_section(input: ParserInput) -> NomResult<CMapSection> {
-    let begin_section = (digit1, space1, tag(&b"beginbfchar"[..]), multispace1);
-    let end_section = (tag(&b"endbfchar"[..]), multispace1);
-    let bf_char_line = delimited(space0, separated_pair(source_code, space0, target_string), multispace1);
-    // Some real-world ToUnicode CMaps contain sections like `0 beginbfchar ... endbfchar`.
-    // Accept empty sections to avoid failing extraction (specifically calling extract_text)
-    let (rest_of_input, bf_char_mappings) = delimited(begin_section, many0(bf_char_line), end_section).parse(input)?;
-    Ok((rest_of_input, CMapSection::BfChar(bf_char_mappings)))
+    let mut begin_section = (digit1, space1, tag(&b"beginbfchar"[..]), multispace1);
+    let (rest, (count, ..)) = begin_section.parse(input)?;
+    let _ = parse_declared_count(count, input);
+    // pdf.js ignores the declared entry count and reads pairs until the
+    // `endbfchar` keyword (CMap.js bfchar loop); pdfium scans words the same
+    // way.  Producers mis-count constantly: issue9949.pdf declares
+    // `1 beginbfchar` ahead of ~70 entries, and gating on the count dropped
+    // the whole block — every Latin code the page uses unmapped — where
+    // pdf.js extracts 'Lorem ipsum'.  Empty sections (`0 beginbfchar` with
+    // no entries) still yield no mappings, so a shell CMap stays empty.
+    let (rest, bf_char_mappings) = collect_entries(rest, b"endbfchar", bf_char_line)?;
+    Ok((rest, CMapSection::BfChar(bf_char_mappings)))
+}
+
+fn bf_char_line(input: ParserInput) -> NomResult<((SourceCode, CodeLen), Vec<u16>)> {
+    delimited(
+        space0,
+        separated_pair(source_code, space0, target_string),
+        multispace1,
+    )
+    .parse(input)
 }
 
 fn target_string(input: ParserInput) -> NomResult<Vec<u16>> {
@@ -277,13 +479,14 @@ fn target_string(input: ParserInput) -> NomResult<Vec<u16>> {
 }
 
 fn bf_range_section(input: ParserInput) -> NomResult<CMapSection> {
-    let begin_section = (digit1, space1, tag(&b"beginbfrange"[..]), multispace1);
-    let end_section = (tag(&b"endbfrange"[..]), multispace1);
-    // Some real-world ToUnicode CMaps contain sections like `0 beginbfrange ... endbfrange`.
-    // Accept empty sections to avoid failing extraction (specifically calling extract_text)
-    let (rest_of_input, bf_range_mappings) =
-        delimited(begin_section, many0(bf_range_line), end_section).parse(input)?;
-    Ok((rest_of_input, CMapSection::BfRange(bf_range_mappings)))
+    let mut begin_section = (digit1, space1, tag(&b"beginbfrange"[..]), multispace1);
+    let (rest, (count, ..)) = begin_section.parse(input)?;
+    let _ = parse_declared_count(count, input);
+    // Same lenient count handling as the bfchar section: pdf.js and pdfium
+    // read entries until the end keyword; the declared count is a hint the
+    // generators do not honor.
+    let (rest, bf_range_mappings) = collect_entries(rest, b"endbfrange", bf_range_line)?;
+    Ok((rest, CMapSection::BfRange(bf_range_mappings)))
 }
 
 fn bf_range_line(input: ParserInput) -> NomResult<SourceRangeMapping> {
@@ -382,7 +585,13 @@ mod tests {
         let data = b"<080f> <08ff> [ <09000110> <08fe> ] \n";
         let (rem, res) = bf_range_line(test_span(data)).unwrap();
         assert_eq!(rem, b"");
-        assert_eq!(res, ((0x080f, 0x08ff, 2), vec![vec![0x0900, 0x0110], vec![0x08fe]]));
+        assert_eq!(
+            res,
+            (
+                (0x080f, 0x08ff, 2),
+                vec![vec![0x0900, 0x0110], vec![0x08fe]]
+            )
+        );
     }
     #[test]
     fn parse_invalid_bfrange_line() {
@@ -415,7 +624,10 @@ mod tests {
             CMapSection::BfRange(vec![
                 ((0x0000, 0x000f, 2), vec![vec![0x0000]]),
                 ((0x0010, 0x001f, 2), vec![vec![0x0000, 0x0010]]),
-                ((0x0020, 0x002f, 2), vec![vec![0x0000], vec![0x0000, 0x0010]]),
+                (
+                    (0x0020, 0x002f, 2),
+                    vec![vec![0x0000], vec![0x0000, 0x0010]]
+                ),
             ])
         );
     }
@@ -439,6 +651,48 @@ mod tests {
                 ((0x20, 1), vec![0x0020]),
             ])
         );
+    }
+
+    #[test]
+    fn miscounted_bfchar_block_keeps_every_entry() {
+        // issue9949.pdf declares `1 beginbfchar` ahead of ~70 entries; the
+        // declared count is a hint pdf.js and pdfium ignore (both scan until
+        // `endbfchar`), and gating on it dropped the whole block — every
+        // Latin code the page uses unmapped, extraction '0SVIQ MTWYQ'
+        // where pdf.js reads 'Lorem ipsum'.
+        let data = b"1 beginbfchar\n\
+            <0000> <0000>\n\
+            <0001> <0000>\n\
+            <0004> <0020>\n\
+            <0030> <004c>\n\
+            <0053> <006f>\n\
+        endbfchar\n";
+        let (rem, res) = bf_char_section(test_span(data)).unwrap();
+        assert_eq!(rem, b"");
+        assert_eq!(
+            res,
+            CMapSection::BfChar(vec![
+                ((0x0000, 2), vec![0x0000]),
+                ((0x0001, 2), vec![0x0000]),
+                ((0x0004, 2), vec![0x0020]),
+                ((0x0030, 2), vec![0x004c]),
+                ((0x0053, 2), vec![0x006f]),
+            ])
+        );
+    }
+
+    #[test]
+    fn miscounted_bfrange_block_keeps_every_entry() {
+        let data = b"1 beginbfrange\n\
+            <0020> <0022> <0041>\n\
+            <0030> <0031> <0061>\n\
+        endbfrange\n";
+        let (rem, res) = bf_range_section(test_span(data)).unwrap();
+        assert_eq!(rem, b"");
+        assert_eq!(res, CMapSection::BfRange(vec![
+            ((0x0020, 0x0022, 2), vec![vec![0x0041]]),
+            ((0x0030, 0x0031, 2), vec![vec![0x0061]]),
+        ]));
     }
 
     #[test]
@@ -497,7 +751,11 @@ end
 end
 ";
         let (_, sections) = cmap_stream(test_span(data)).unwrap();
-        assert!(sections.contains(&CMapSection::BfChar(vec![((0x0c6d, 2), vec![0x2460])])));
+        assert!(
+            sections
+                .sections
+                .contains(&CMapSection::BfChar(vec![((0x0c6d, 2), vec![0x2460])]))
+        );
     }
 
     #[test]

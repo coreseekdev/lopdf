@@ -1,4 +1,6 @@
-use crate::{Dictionary, Document, Object, ObjectId, Result};
+use std::collections::BTreeSet;
+
+use crate::{Dictionary, Document, Object, ObjectId, PdfName, Result};
 
 #[derive(Debug, Clone)]
 pub struct IncrementalDocument {
@@ -11,6 +13,10 @@ pub struct IncrementalDocument {
 
     /// A new document appended to the previously loaded file.
     pub new_document: Document,
+
+    /// Objects removed by the edit; the appended xref writes them as free
+    /// entries with generation + 1.
+    deleted_objects: BTreeSet<ObjectId>,
 }
 
 impl IncrementalDocument {
@@ -20,6 +26,7 @@ impl IncrementalDocument {
             bytes_documents: Vec::new(),
             prev_documents: Document::new(),
             new_document: Document::new(),
+            deleted_objects: BTreeSet::new(),
         }
     }
 
@@ -32,7 +39,20 @@ impl IncrementalDocument {
             bytes_documents: prev_bytes,
             new_document: Document::new_from_prev(&prev_documents),
             prev_documents,
+            deleted_objects: BTreeSet::new(),
         }
+    }
+
+    /// Removes an object from the graph and records the removal, so the
+    /// appended xref gets a free entry with generation + 1 instead of leaving
+    /// the older revision resolvable (pdfium CPDF_CrossRefTable).
+    pub fn delete_object(&mut self, id: ObjectId) -> Option<Object> {
+        self.deleted_objects.insert(id);
+        self.new_document.delete_object(id)
+    }
+
+    pub(crate) fn deleted_objects(&self) -> &BTreeSet<ObjectId> {
+        &self.deleted_objects
     }
 
     /// Get the structure of the previous documents (all prev incremental updates combined.)
@@ -60,22 +80,17 @@ impl IncrementalDocument {
     /// Get the page's resource dictionary (only in new document).
     ///
     /// Get Object that has the key `Resources`.
-    ///
-    /// A page without its own `/Resources` gets a copy of the one it inherits from the page
-    /// tree, if any, so that adding a resource does not hide the inherited ones.
     pub fn get_or_create_resources(&mut self, page_id: ObjectId) -> Result<&mut Object> {
         self.opt_clone_object_to_new_document(page_id)?;
-        let (resources_id, inherited) = {
-            let page = self.new_document.get_object(page_id).and_then(Object::as_dict)?;
+        let resources_id = {
+            let page = self
+                .new_document
+                .get_object(page_id)
+                .and_then(Object::as_dict)?;
             if page.has(b"Resources") {
-                (page.get(b"Resources").and_then(Object::as_reference).ok(), None)
+                page.get(b"Resources").and_then(Object::as_reference).ok()
             } else {
-                // The page tree may be partly or entirely in the previous documents.
-                let inherited = self
-                    .new_document
-                    .inherited_resources(page)
-                    .or_else(|_| self.prev_documents.inherited_resources(page));
-                (None, inherited.ok().flatten().cloned())
+                None
             }
         };
         if let Some(res_id) = resources_id {
@@ -87,7 +102,7 @@ impl IncrementalDocument {
             .get_object_mut(page_id)
             .and_then(Object::as_dict_mut)?;
         if !page.has(b"Resources") {
-            page.set(b"Resources", inherited.unwrap_or_default());
+            page.set(b"Resources", Dictionary::new());
         }
         page.get_mut(b"Resources")
     }
@@ -95,16 +110,25 @@ impl IncrementalDocument {
     /// Add XObject to a page.
     ///
     /// Get Object that has the key `Resources -> XObject`.
-    pub fn add_xobject<N: Into<Vec<u8>>>(
-        &mut self, page_id: ObjectId, xobject_name: N, xobject_id: ObjectId,
+    pub fn add_xobject<N: Into<PdfName>>(
+        &mut self,
+        page_id: ObjectId,
+        xobject_name: N,
+        xobject_id: ObjectId,
     ) -> Result<()> {
-        if let Ok(resources) = self.get_or_create_resources(page_id).and_then(Object::as_dict_mut) {
+        if let Ok(resources) = self
+            .get_or_create_resources(page_id)
+            .and_then(Object::as_dict_mut)
+        {
             if !resources.has(b"XObject") {
                 resources.set("XObject", Dictionary::new());
             }
             let mut xobjects = resources.get_mut(b"XObject")?;
-            if let Object::Reference(xobjects_id) = *xobjects {
-                self.opt_clone_object_to_new_document(xobjects_id)?;
+            if let Object::Reference(xobjects_ref_id) = xobjects {
+                let mut xobjects_id = *xobjects_ref_id;
+                while let Object::Reference(id) = self.new_document.get_object(xobjects_id)? {
+                    xobjects_id = *id;
+                }
                 xobjects = self.new_document.get_object_mut(xobjects_id)?;
             }
             let xobjects = Object::as_dict_mut(xobjects)?;
@@ -116,19 +140,22 @@ impl IncrementalDocument {
     /// Add Graphics State to a page.
     ///
     /// Get Object that has the key `Resources -> ExtGState`.
-    pub fn add_graphics_state<N: Into<Vec<u8>>>(
-        &mut self, page_id: ObjectId, gs_name: N, gs_id: ObjectId,
+    pub fn add_graphics_state<N: Into<PdfName>>(
+        &mut self,
+        page_id: ObjectId,
+        gs_name: N,
+        gs_id: ObjectId,
     ) -> Result<()> {
-        if let Ok(resources) = self.get_or_create_resources(page_id).and_then(Object::as_dict_mut) {
+        if let Ok(resources) = self
+            .get_or_create_resources(page_id)
+            .and_then(Object::as_dict_mut)
+        {
             if !resources.has(b"ExtGState") {
                 resources.set("ExtGState", Dictionary::new());
             }
-            let mut states = resources.get_mut(b"ExtGState")?;
-            if let Object::Reference(states_id) = *states {
-                self.opt_clone_object_to_new_document(states_id)?;
-                states = self.new_document.get_object_mut(states_id)?;
-            }
-            let states = Object::as_dict_mut(states)?;
+            let states = resources
+                .get_mut(b"ExtGState")
+                .and_then(Object::as_dict_mut)?;
             states.set(gs_name, Object::Reference(gs_id));
         }
         Ok(())

@@ -3,8 +3,8 @@ use super::{Bookmark, Dictionary, Object, ObjectId};
 use crate::encryption::crypt_filters::*;
 use crate::encryption::{self, EncryptionState, PasswordAlgorithm};
 use crate::xobject::PdfImage;
-use crate::xref::{Xref, XrefRecovery, XrefType};
-use crate::{DecompressError, Error, Linearization, ObjectStream, Result, Stream};
+use crate::xref::{Xref, XrefType};
+use crate::{DecompressError, Error, ObjectStream, Result, Stream};
 use log::debug;
 use std::cmp::max;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -62,39 +62,9 @@ pub struct Document {
     /// Default value is `0`.
     pub xref_start: usize,
 
-    /// How loading repaired the cross-reference data, or `None` when it was read as written.
-    /// A rebuilt table takes precedence over offsets corrected before resolution failed.
-    /// Like `xref_start`, this is only set during reading.
-    pub xref_recovery: Option<XrefRecovery>,
-
     /// The encryption state stores the parameters that were used to decrypt this document if the
     /// document has been decrypted.
     pub encryption_state: Option<EncryptionState>,
-
-    /// The linearization parameter dictionary that the file opens with, or `None` when the file
-    /// is not linearized. Like `xref_start`, this is only set during reading.
-    pub linearization: Option<Linearization>,
-
-    /// How many cross-reference sections the `startxref` and `/Prev` chain of the file holds,
-    /// not counting the cross-reference streams of hybrid-reference sections, or 0 when the
-    /// table was rebuilt by scanning or the document was not read from a file. Like
-    /// `xref_start`, this is only set during reading.
-    pub xref_section_count: usize,
-}
-
-/// The object IDs that a traversal from the trailer reaches, in the order it first meets them.
-#[derive(Default)]
-pub(crate) struct TraversedReferences {
-    pub(crate) order: Vec<ObjectId>,
-    pub(crate) seen: HashSet<ObjectId>,
-}
-
-impl TraversedReferences {
-    fn insert(&mut self, id: ObjectId) {
-        if self.seen.insert(id) {
-            self.order.push(id);
-        }
-    }
 }
 
 impl Document {
@@ -122,7 +92,12 @@ impl Document {
     /// The state a freshly started document shares, whether it begins from
     /// nothing or as an incremental update of a previous one. Only the
     /// trailer, the cross-reference type and the two id ceilings carry over.
-    fn with_baseline(trailer: Dictionary, cross_reference_type: XrefType, max_id: u32, max_bookmark_id: u32) -> Self {
+    fn with_baseline(
+        trailer: Dictionary,
+        cross_reference_type: XrefType,
+        max_id: u32,
+        max_bookmark_id: u32,
+    ) -> Self {
         Self {
             version: "1.4".to_string(),
             binary_mark: vec![0xBB, 0xAD, 0xC0, 0xDE],
@@ -134,22 +109,8 @@ impl Document {
             bookmarks: Vec::new(),
             bookmark_table: HashMap::new(),
             xref_start: 0,
-            xref_recovery: None,
             encryption_state: None,
-            linearization: None,
-            xref_section_count: 0,
         }
-    }
-
-    /// The number of revisions of the file the document was read from: its original version
-    /// and one for each incremental update.
-    ///
-    /// A linearized file holds two cross-reference sections in one revision, the first-page
-    /// section and the main one. A document whose table was rebuilt by scanning, or that was
-    /// not read from a file, counts as one revision.
-    pub fn revision_count(&self) -> usize {
-        let linearized = usize::from(self.linearization.is_some() && self.xref_section_count >= 2);
-        self.xref_section_count.saturating_sub(linearized).max(1)
     }
 
     const DEREF_LIMIT: usize = 128;
@@ -198,13 +159,19 @@ impl Document {
     /// The object id will be None if the object was not a
     /// reference. Otherwise, it will be the last object id in the
     /// reference chain.
-    pub fn dereference<'a>(&'a self, mut object: &'a Object) -> Result<(Option<ObjectId>, &'a Object)> {
+    pub fn dereference<'a>(
+        &'a self,
+        mut object: &'a Object,
+    ) -> Result<(Option<ObjectId>, &'a Object)> {
         let mut nb_deref = 0;
         let mut id = None;
 
         while let Ok(ref_id) = object.as_reference() {
             id = Some(ref_id);
-            object = self.objects.get(&ref_id).ok_or(Error::ObjectNotFound(ref_id))?;
+            object = self
+                .objects
+                .get(&ref_id)
+                .ok_or(Error::ObjectNotFound(ref_id))?;
 
             nb_deref += 1;
             if nb_deref > Self::DEREF_LIMIT {
@@ -264,7 +231,11 @@ impl Document {
     }
 
     /// Get dictionary in dictionary by key.
-    pub fn get_dict_in_dict<'a>(&'a self, node: &'a Dictionary, key: &[u8]) -> Result<&'a Dictionary> {
+    pub fn get_dict_in_dict<'a>(
+        &'a self,
+        node: &'a Dictionary,
+        key: &[u8],
+    ) -> Result<&'a Dictionary> {
         match node.get(key)? {
             Object::Reference(object_id) => self.get_dictionary(*object_id),
             Object::Dictionary(dic) => Ok(dic),
@@ -277,38 +248,45 @@ impl Document {
 
     /// Traverse objects from trailer recursively, return all referenced object IDs.
     pub fn traverse_objects<A: Fn(&mut Object)>(&mut self, action: A) -> Vec<ObjectId> {
-        self.traverse_objects_inner(action).order
-    }
-
-    /// Traverse objects from trailer recursively, collecting each referenced object ID once.
-    /// A set records the IDs already seen, so the traversal takes time linear in the
-    /// number of references.
-    pub(crate) fn traverse_objects_inner<A: Fn(&mut Object)>(&mut self, action: A) -> TraversedReferences {
-        fn traverse_array<A: Fn(&mut Object)>(array: &mut [Object], action: &A, refs: &mut TraversedReferences) {
+        fn traverse_array<A: Fn(&mut Object)>(
+            array: &mut [Object],
+            action: &A,
+            refs: &mut Vec<ObjectId>,
+        ) {
             for item in array.iter_mut() {
                 traverse_object(item, action, refs);
             }
         }
-        fn traverse_dictionary<A: Fn(&mut Object)>(dict: &mut Dictionary, action: &A, refs: &mut TraversedReferences) {
+        fn traverse_dictionary<A: Fn(&mut Object)>(
+            dict: &mut Dictionary,
+            action: &A,
+            refs: &mut Vec<ObjectId>,
+        ) {
             for (_, v) in dict.iter_mut() {
                 traverse_object(v, action, refs);
             }
         }
-        fn traverse_object<A: Fn(&mut Object)>(object: &mut Object, action: &A, refs: &mut TraversedReferences) {
+        fn traverse_object<A: Fn(&mut Object)>(
+            object: &mut Object,
+            action: &A,
+            refs: &mut Vec<ObjectId>,
+        ) {
             action(object);
             match object {
                 Object::Array(array) => traverse_array(array, action, refs),
                 Object::Dictionary(dict) => traverse_dictionary(dict, action, refs),
                 Object::Stream(stream) => traverse_dictionary(&mut stream.dict, action, refs),
-                Object::Reference(id) => refs.insert(*id),
+                Object::Reference(id) if !refs.contains(id) => {
+                    refs.push(*id);
+                }
                 _ => {}
             }
         }
-        let mut refs = TraversedReferences::default();
+        let mut refs = vec![];
         traverse_dictionary(&mut self.trailer, &action, &mut refs);
         let mut index = 0;
-        while index < refs.order.len() {
-            if let Some(object) = self.objects.get_mut(&refs.order[index]) {
+        while index < refs.len() {
+            if let Some(object) = self.objects.get_mut(&refs[index]) {
                 traverse_object(object, &action, &mut refs);
             }
             index += 1;
@@ -329,6 +307,32 @@ impl Document {
         self.get_encrypted().is_ok()
     }
 
+    /// Whether the effective stream and string crypt filters are `/Identity`
+    /// (`/V` 4 or 5 with `/StmF` and `/StrF` both `/Identity`).  pdfium treats
+    /// that as "no cipher" and accepts the document without a password check
+    /// (cpdf_security_handler.cpp, `OnInit`: `cipher_ == kNone` returns true),
+    /// because only `/EFF` embedded-file streams are encrypted.  Page content
+    /// and strings are plaintext in such files even when `/Encrypt` carries
+    /// real `/O` and `/U` values.
+    pub fn has_identity_crypt_filters(&self) -> bool {
+        let Ok(encrypted) = self.get_encrypted() else {
+            return false;
+        };
+        let Ok(version) = encrypted.get(b"V").and_then(Object::as_i64) else {
+            return false;
+        };
+        if version < 4 {
+            return false;
+        }
+        let Ok(stream_filter) = encrypted.get(b"StmF").and_then(Object::as_name) else {
+            return false;
+        };
+        let Ok(string_filter) = encrypted.get(b"StrF").and_then(Object::as_name) else {
+            return false;
+        };
+        stream_filter == b"Identity" && string_filter == b"Identity"
+    }
+
     /// Return true if the document was originally encrypted when loaded
     pub fn was_encrypted(&self) -> bool {
         self.encryption_state.is_some()
@@ -345,13 +349,35 @@ impl Document {
     }
 
     /// Run the owner and/or user check against an already-prepared password.
-    fn authenticate_with(&self, algorithm: &PasswordAlgorithm, password: &[u8], role: PasswordRole) -> Result<()> {
+    fn authenticate_with(
+        &self,
+        algorithm: &PasswordAlgorithm,
+        password: &[u8],
+        role: PasswordRole,
+    ) -> Result<()> {
         match role {
-            PasswordRole::Owner => algorithm.authenticate_owner_password(self, password)?,
+            PasswordRole::Owner => {
+                // pdfium `UnlockOwner` (cpdf_security_handler.cpp:231-243):
+                // an empty credential is never an owner credential.
+                if password.is_empty() {
+                    return Err(encryption::DecryptionError::IncorrectPassword.into());
+                }
+                algorithm.authenticate_owner_password(self, password)?;
+            }
             PasswordRole::User => algorithm.authenticate_user_password(self, password)?,
-            PasswordRole::Either => algorithm
-                .authenticate_owner_password(self, password)
-                .or(algorithm.authenticate_user_password(self, password))?,
+            PasswordRole::Either => {
+                // pdfium `CheckSecurity` (cpdf_security_handler.cpp:213-220):
+                // a non-empty credential is tried as owner first, then as the
+                // user password; the empty credential only as the user one.
+                if !password.is_empty()
+                    && algorithm
+                        .authenticate_owner_password(self, password)
+                        .is_ok()
+                {
+                    return Ok(());
+                }
+                algorithm.authenticate_user_password(self, password)?;
+            }
         }
 
         Ok(())
@@ -362,7 +388,11 @@ impl Document {
     where
         P: AsRef<[u8]>,
     {
-        self.authenticate_with(&self.password_algorithm()?, password.as_ref(), PasswordRole::Owner)
+        self.authenticate_with(
+            &self.password_algorithm()?,
+            password.as_ref(),
+            PasswordRole::Owner,
+        )
     }
 
     /// Authenticate the provided user password directly as bytes without sanitization
@@ -370,7 +400,11 @@ impl Document {
     where
         P: AsRef<[u8]>,
     {
-        self.authenticate_with(&self.password_algorithm()?, password.as_ref(), PasswordRole::User)
+        self.authenticate_with(
+            &self.password_algorithm()?,
+            password.as_ref(),
+            PasswordRole::User,
+        )
     }
 
     /// Authenticate the provided owner/user password as bytes without sanitization
@@ -378,7 +412,11 @@ impl Document {
     where
         P: AsRef<[u8]>,
     {
-        self.authenticate_with(&self.password_algorithm()?, password.as_ref(), PasswordRole::Either)
+        self.authenticate_with(
+            &self.password_algorithm()?,
+            password.as_ref(),
+            PasswordRole::Either,
+        )
     }
 
     /// Authenticate the provided owner password
@@ -452,15 +490,12 @@ impl Document {
         }
 
         let encrypted = state.encode()?;
-        // Take the ID before encrypting anything, so that running out of IDs leaves the
-        // document as it was.
-        let object_id = self.try_new_object_id()?;
 
         for (&id, obj) in self.objects.iter_mut() {
             encryption::encrypt_object(state, id, obj)?;
         }
 
-        self.objects.insert(object_id, Object::Dictionary(encrypted));
+        let object_id = self.add_object(encrypted);
         self.trailer.set(b"Encrypt", Object::Reference(object_id));
         self.encryption_state = None;
 
@@ -468,9 +503,6 @@ impl Document {
     }
 
     /// Replaces all encrypted Strings and Streams with their decrypted contents
-    ///
-    /// An object that cannot be decrypted does not stop the rest of the document from being
-    /// decrypted; the first error is returned once the whole document has been visited.
     pub fn decrypt(&mut self, password: &str) -> Result<()> {
         if !self.is_encrypted() {
             return Err(Error::NotEncrypted);
@@ -481,7 +513,8 @@ impl Document {
         self.decrypt_raw(&password)
     }
 
-    /// Same as [`Document::decrypt`], with the password passed as bytes without sanitization.
+    /// Replaces all encrypted Strings and Streams with their decrypted contents with the password
+    /// provided directly as bytes without sanitization
     pub fn decrypt_raw<P>(&mut self, password: P) -> Result<()>
     where
         P: AsRef<[u8]>,
@@ -493,10 +526,12 @@ impl Document {
         self.authenticate_raw_password(&password)?;
 
         // Find the ID of the encryption dict; we'll want to skip it when decrypting
-        let encryption_obj_id = self.trailer.get(b"Encrypt").and_then(Object::as_reference)?;
+        let encryption_obj_id = self
+            .trailer
+            .get(b"Encrypt")
+            .and_then(Object::as_reference)?;
 
         let mut state = EncryptionState::decode(&*self, password)?;
-        let mut first_error = None;
 
         for (&id, obj) in self.objects.iter_mut() {
             // The encryption dictionary is not encrypted, leave it alone
@@ -504,9 +539,7 @@ impl Document {
                 continue;
             }
 
-            if let Err(error) = encryption::decrypt_object(&state, id, obj) {
-                first_error.get_or_insert(error);
-            }
+            encryption::decrypt_object(&state, id, obj)?;
         }
 
         // Add the objects from the object streams now that they have been decrypted.
@@ -545,7 +578,7 @@ impl Document {
 
         self.encryption_state = Some(state);
 
-        first_error.map_or(Ok(()), |error| Err(error.into()))
+        Ok(())
     }
 
     /// Return the PDF document catalog, which is the root of the document's object graph.
@@ -567,11 +600,79 @@ impl Document {
 
     /// Get page numbers and corresponding object ids.
     pub fn get_pages(&self) -> BTreeMap<u32, ObjectId> {
-        self.page_iter().enumerate().map(|(i, p)| ((i + 1) as u32, p)).collect()
+        self.page_iter()
+            .enumerate()
+            .map(|(i, p)| ((i + 1) as u32, p))
+            .collect()
     }
 
     pub fn page_iter(&self) -> impl Iterator<Item = ObjectId> + '_ {
         PageTreeIter::new(self)
+    }
+
+    /// Replaces inline page (and nested `/Pages`) dictionaries in `/Kids`
+    /// arrays with real indirect objects, so the page iterator can yield an
+    /// id for every leaf.  Damaged files sometimes write the dictionary in
+    /// place instead of a reference; pdfium and pdf.js both materialise it.
+    pub(crate) fn materialize_inline_pages(&mut self) -> Result<()> {
+        let Some(pages_id) = self
+            .catalog()
+            .ok()
+            .and_then(|catalog| catalog.get(b"Pages").ok())
+            .and_then(|pages| pages.as_reference().ok())
+        else {
+            return Ok(());
+        };
+        let mut visited = std::collections::BTreeSet::new();
+        self.materialize_inline_pages_in(pages_id, &mut visited, 0)
+    }
+
+    fn materialize_inline_pages_in(
+        &mut self,
+        node: ObjectId,
+        visited: &mut std::collections::BTreeSet<ObjectId>,
+        depth: usize,
+    ) -> Result<()> {
+        if depth >= crate::reader::MAX_NESTING_DEPTH || !visited.insert(node) {
+            return Ok(());
+        }
+        let Some(dict) = self.get_dictionary(node).ok().cloned() else {
+            return Ok(());
+        };
+        let Some(kids) = dict.get(b"Kids").and_then(Object::as_array).ok().cloned() else {
+            return Ok(());
+        };
+        let mut rewritten = Vec::with_capacity(kids.len());
+        let mut changed = false;
+        for kid in kids {
+            match kid {
+                Object::Dictionary(inner) => {
+                    let is_pages = inner
+                        .get_type()
+                        .map(|kind| kind == b"Pages")
+                        .unwrap_or_else(|_| inner.has(b"Kids"));
+                    let id = self.add_object(Object::Dictionary(inner));
+                    rewritten.push(Object::Reference(id));
+                    changed = true;
+                    if is_pages {
+                        self.materialize_inline_pages_in(id, visited, depth + 1)?;
+                    }
+                }
+                Object::Reference(id) => {
+                    rewritten.push(Object::Reference(id));
+                    // Only nested /Pages nodes do work here; page leaves
+                    // return immediately.
+                    self.materialize_inline_pages_in(id, visited, depth + 1)?;
+                }
+                other => rewritten.push(other),
+            }
+        }
+        if changed {
+            if let Ok(dict) = self.get_dictionary_mut(node) {
+                dict.set("Kids", Object::Array(rewritten));
+            }
+        }
+        Ok(())
     }
 
     /// Get content stream object ids of a page.
@@ -616,14 +717,14 @@ impl Document {
     pub fn add_page_contents(&mut self, page_id: ObjectId, content: Vec<u8>) -> Result<()> {
         let page = self.get_dictionary(page_id)?;
         let mut current_content_list: Vec<Object> = match page.get(b"Contents") {
-            Ok(Object::Reference(id)) => match self.get_object(*id) {
-                Ok(Object::Array(arr)) => arr.clone(),
-                _ => vec![Object::Reference(*id)],
-            },
+            Ok(Object::Reference(id)) => {
+                vec![Object::Reference(*id)]
+            }
             Ok(Object::Array(arr)) => arr.clone(),
             _ => vec![],
         };
-        let content_object_id = self.add_object(Object::Stream(Stream::new(Dictionary::new(), content)));
+        let content_object_id =
+            self.add_object(Object::Stream(Stream::new(Dictionary::new(), content)));
         current_content_list.push(Object::Reference(content_object_id));
 
         let page_mut = self.get_object_mut(page_id).and_then(Object::as_dict_mut)?;
@@ -647,15 +748,20 @@ impl Document {
     /// `max_decompressed_size` bytes (each stream is decoded against the
     /// *remaining* budget, so N streams cannot sum to N times the limit), which
     /// stops a small compressed page stream from inflating without limit when
-    /// processing untrusted PDFs. Use it instead of the unbounded
-    /// [`Document::get_page_content`] for input you do not control.
+    /// processing untrusted PDFs. Use it (and
+    /// [`Document::extract_text_with_limit`]) instead of the unbounded variants
+    /// for input you do not control.
     ///
     /// Returns [`DecompressError::MemoryLimitExceeded`](crate::DecompressError::MemoryLimitExceeded)
     /// if the page content would exceed the limit. Like
     /// [`Document::get_page_content`], a stream that fails to decode for a reason
     /// *other* than the size limit falls back to its raw bytes, but that fallback
     /// is also kept within the remaining budget.
-    pub fn get_page_content_with_limit(&self, page_id: ObjectId, max_decompressed_size: usize) -> Result<Vec<u8>> {
+    pub fn get_page_content_with_limit(
+        &self,
+        page_id: ObjectId,
+        max_decompressed_size: usize,
+    ) -> Result<Vec<u8>> {
         self.page_content(page_id, Some(max_decompressed_size))
     }
 
@@ -665,7 +771,11 @@ impl Document {
     /// A stream that fails to decode falls back to its raw bytes; under a limit,
     /// the fallback is itself charged against the remaining budget, and a stream
     /// that would exceed the limit is rejected rather than truncated.
-    fn page_content(&self, page_id: ObjectId, max_decompressed_size: Option<usize>) -> Result<Vec<u8>> {
+    fn page_content(
+        &self,
+        page_id: ObjectId,
+        max_decompressed_size: Option<usize>,
+    ) -> Result<Vec<u8>> {
         let exceeded = || {
             DecompressError::MemoryLimitExceeded {
                 limit: max_decompressed_size.unwrap_or(0),
@@ -681,14 +791,18 @@ impl Document {
             let remaining = max_decompressed_size.map(|max| max.saturating_sub(content.len()));
 
             match remaining {
-                Some(remaining) => match content_stream.decompressed_content_with_limit(remaining) {
-                    Ok(data) => content.extend_from_slice(&data),
-                    Err(Error::Decompress(DecompressError::MemoryLimitExceeded { .. })) => return Err(exceeded()),
-                    Err(_) if content_stream.content.len() <= remaining => {
-                        content.extend_from_slice(&content_stream.content);
+                Some(remaining) => {
+                    match content_stream.decompressed_content_with_limit(remaining) {
+                        Ok(data) => content.extend_from_slice(&data),
+                        Err(Error::Decompress(DecompressError::MemoryLimitExceeded { .. })) => {
+                            return Err(exceeded());
+                        }
+                        Err(_) if content_stream.content.len() <= remaining => {
+                            content.extend_from_slice(&content_stream.content);
+                        }
+                        Err(_) => return Err(exceeded()),
                     }
-                    Err(_) => return Err(exceeded()),
-                },
+                }
                 None => match content_stream.decompressed_content() {
                     Ok(data) => content.extend_from_slice(&data),
                     Err(_) => content.extend_from_slice(&content_stream.content),
@@ -700,23 +814,18 @@ impl Document {
     }
 
     /// Get resources used by a page.
-    ///
-    /// Returns the nearest `/Resources` when it is a dictionary written directly into the page
-    /// or one of its ancestors in the page tree (ISO 32000-1, 7.7.3.4), and the ids of every
-    /// `/Resources` the page and its ancestors refer to.
-    pub fn get_page_resources(&self, page_id: ObjectId) -> Result<(Option<&Dictionary>, Vec<ObjectId>)> {
-        fn collect_resources<'a>(
-            page_node: &'a Dictionary, resource_dict: &mut Option<&'a Dictionary>, resource_ids: &mut Vec<ObjectId>,
-            doc: &'a Document, already_seen: &mut HashSet<ObjectId>,
+    pub fn get_page_resources(
+        &self,
+        page_id: ObjectId,
+    ) -> Result<(Option<&Dictionary>, Vec<ObjectId>)> {
+        fn collect_resources(
+            page_node: &Dictionary,
+            resource_ids: &mut Vec<ObjectId>,
+            doc: &Document,
+            already_seen: &mut HashSet<ObjectId>,
         ) -> Result<()> {
-            match page_node.get(b"Resources") {
-                Ok(Object::Reference(resource_id)) => resource_ids.push(*resource_id),
-                // Callers look at this dictionary before the referenced ones, so an ancestor's is
-                // only taken when nothing nearer has `/Resources`.
-                Ok(Object::Dictionary(dict)) if resource_dict.is_none() && resource_ids.is_empty() => {
-                    *resource_dict = Some(dict);
-                }
-                _ => {}
+            if let Ok(resource_id) = page_node.get(b"Resources").and_then(Object::as_reference) {
+                resource_ids.push(resource_id);
             }
             if let Ok(parent_id) = page_node.get(b"Parent").and_then(Object::as_reference) {
                 if already_seen.contains(&parent_id) {
@@ -727,7 +836,7 @@ impl Document {
                 }
                 already_seen.insert(parent_id);
                 let parent_dict = doc.get_dictionary(parent_id)?;
-                collect_resources(parent_dict, resource_dict, resource_ids, doc, already_seen)?;
+                collect_resources(parent_dict, resource_ids, doc, already_seen)?;
             }
             Ok(())
         }
@@ -735,7 +844,8 @@ impl Document {
         let mut resource_dict = None;
         let mut resource_ids = Vec::new();
         if let Ok(page) = self.get_dictionary(page_id) {
-            collect_resources(page, &mut resource_dict, &mut resource_ids, self, &mut HashSet::new())?;
+            resource_dict = page.get(b"Resources").and_then(Object::as_dict).ok();
+            collect_resources(page, &mut resource_ids, self, &mut HashSet::new())?;
         }
         Ok((resource_dict, resource_ids))
     }
@@ -743,7 +853,9 @@ impl Document {
     /// Get fonts used by a page.
     pub fn get_page_fonts(&self, page_id: ObjectId) -> Result<BTreeMap<Vec<u8>, &Dictionary>> {
         fn collect_fonts_from_resources<'a>(
-            resources: &'a Dictionary, fonts: &mut BTreeMap<Vec<u8>, &'a Dictionary>, doc: &'a Document,
+            resources: &'a Dictionary,
+            fonts: &mut BTreeMap<Vec<u8>, &'a Dictionary>,
+            doc: &'a Document,
         ) {
             if let Ok(font) = resources.get(b"Font") {
                 let font_dict = match font {
@@ -758,8 +870,8 @@ impl Document {
                             Object::Dictionary(dict) => Some(dict),
                             _ => None,
                         };
-                        if !fonts.contains_key(name) {
-                            font.map(|font| fonts.insert(name.clone(), font));
+                        if !fonts.contains_key(name.as_slice()) {
+                            font.map(|font| fonts.insert(name.to_vec(), font));
                         }
                     }
                 }
@@ -815,7 +927,9 @@ impl Document {
             return Ok((page_id, &[]));
         };
         match page.get(b"Annots") {
-            Ok(Object::Reference(id)) => Ok((*id, self.get_object(*id).and_then(Object::as_array)?)),
+            Ok(Object::Reference(id)) => {
+                Ok((*id, self.get_object(*id).and_then(Object::as_array)?))
+            }
             Ok(Object::Array(entries)) => Ok((page_id, entries)),
             _ => Ok((page_id, &[])),
         }
@@ -894,7 +1008,10 @@ impl Document {
         for slot in plan {
             match slot {
                 Slot::Referenced(id) => {
-                    if let Some(dictionary) = referenced_objs.remove(&id).and_then(|object| object.as_dict_mut().ok()) {
+                    if let Some(dictionary) = referenced_objs
+                        .remove(&id)
+                        .and_then(|object| object.as_dict_mut().ok())
+                    {
                         annotations.push(dictionary);
                     }
                 }
@@ -908,31 +1025,10 @@ impl Document {
         Ok(annotations)
     }
 
-    /// The `/Resources` dictionary of a page tree node or, when it has none, the one it
-    /// inherits from the nearest ancestor that has one (ISO 32000-1, 7.7.3.4).
-    pub(crate) fn inherited_resources<'a>(&'a self, mut node: &'a Dictionary) -> Result<Option<&'a Dictionary>> {
-        let mut seen = HashSet::new();
-        loop {
-            if node.has(b"Resources") {
-                return self.get_dict_in_dict(node, b"Resources").map(Some);
-            }
-            let Ok(parent_id) = node.get(b"Parent").and_then(Object::as_reference) else {
-                return Ok(None);
-            };
-            if !seen.insert(parent_id) {
-                return Err(Error::ReferenceCycle(parent_id));
-            }
-            node = self.get_dictionary(parent_id)?;
-        }
-    }
-
     pub fn get_page_images(&'_ self, page_id: ObjectId) -> Result<Vec<PdfImage<'_>>> {
         let mut images = vec![];
         if let Ok(page) = self.get_dictionary(page_id) {
-            let Some(resources) = self.inherited_resources(page)? else {
-                // No resources, so no images.
-                return Ok(Vec::default());
-            };
+            let resources = self.get_dict_in_dict(page, b"Resources")?;
             let xobject = match self.get_dict_in_dict(resources, b"XObject") {
                 Ok(xobject) => xobject,
                 Err(err) => match err {
@@ -955,7 +1051,9 @@ impl Document {
                 let color_space = match dict.get(b"ColorSpace") {
                     Ok(cs) => match cs {
                         Object::Array(array) => match array.first() {
-                            Some(first) => Some(String::from_utf8_lossy(first.as_name()?).to_string()),
+                            Some(first) => {
+                                Some(String::from_utf8_lossy(first.as_name()?).to_string())
+                            }
                             None => None,
                         },
                         Object::Name(name) => Some(String::from_utf8_lossy(name).to_string()),
@@ -1018,32 +1116,47 @@ struct PageTreeIter<'a> {
     doc: &'a Document,
     stack: Vec<&'a [Object]>,
     kids: Option<&'a [Object]>,
+    /// Bound on the Kids slots visited.  A page leaf may legitimately appear
+    /// more than once (and malformed files repeat it), so the object count is
+    /// only a floor: a shell document holds just the page tree, while its
+    /// /Kids arrays can still name more leaves than there are objects.
     iter_limit: usize,
+    /// Page-tree nodes already entered, so a self-referencing /Pages kid is
+    /// skipped instead of walking to the depth limit.
+    visited: std::collections::BTreeSet<ObjectId>,
 }
 
 impl<'a> PageTreeIter<'a> {
-    const PAGE_TREE_DEPTH_LIMIT: usize = 256;
-
     fn new(doc: &'a Document) -> Self {
         if let Ok(page_tree_id) = doc
             .catalog()
             .and_then(|cat| cat.get(b"Pages"))
             .and_then(Object::as_reference)
         {
+            // The root is already "entered"; a /Kids entry that points back
+            // at it is a self-reference and must not be descended.
+            let mut visited = std::collections::BTreeSet::new();
+            visited.insert(page_tree_id);
             Self {
                 doc,
                 kids: Self::kids(doc, page_tree_id),
                 stack: Vec::with_capacity(32),
-                iter_limit: doc.objects.len(),
+                iter_limit: Self::iteration_limit(doc),
+                visited,
             }
         } else {
             Self {
                 doc,
                 kids: None,
                 stack: Vec::new(),
-                iter_limit: doc.objects.len(),
+                iter_limit: Self::iteration_limit(doc),
+                visited: std::collections::BTreeSet::new(),
             }
         }
+    }
+
+    fn iteration_limit(doc: &Document) -> usize {
+        doc.objects.len().saturating_mul(8).max(1024)
     }
 
     fn kids(doc: &Document, page_tree_id: ObjectId) -> Option<&[Object]> {
@@ -1069,32 +1182,40 @@ impl Iterator for PageTreeIter<'_> {
                 self.kids = Some(new_kids);
 
                 if let Ok(kid_id) = kid.as_reference() {
-                    match self.doc.get_dictionary(kid_id).and_then(Dictionary::get_type) {
-                        Ok(b"Page") => {
+                    let Ok(dict) = self.doc.get_dictionary(kid_id) else {
+                        // The kid cannot be loaded; keep its slot as a blank
+                        // stand-in page (MuPDF behaviour).
+                        return Some(kid_id);
+                    };
+                    let is_page = dict.get_type().map(|kind| kind == b"Page").unwrap_or(false);
+                    let is_pages = dict
+                        .get_type()
+                        .map(|kind| kind == b"Pages")
+                        .unwrap_or_else(|_| dict.has(b"Kids"));
+                    if !is_page && is_pages {
+                        // A self-referencing /Pages node is skipped.
+                        if !self.visited.insert(kid_id) {
+                            continue;
+                        }
+                        let Some(kids) = Self::kids(self.doc, kid_id) else {
+                            // A /Pages node without /Kids still occupies one
+                            // page slot rather than vanishing.
                             return Some(kid_id);
+                        };
+                        let current = self.kids.unwrap();
+                        if !current.is_empty() {
+                            self.stack.push(current);
                         }
-                        Ok(b"Pages") if self.stack.len() < Self::PAGE_TREE_DEPTH_LIMIT => {
-                            let kids = self.kids.unwrap();
-                            if !kids.is_empty() {
-                                self.stack.push(kids);
-                            }
-                            self.kids = Self::kids(self.doc, kid_id);
-                        }
-                        Ok(b"Pages") => {}
-                        Ok(_) => {}
-                        // The kid reference itself can't be loaded as a dictionary with a
-                        // type (missing object, unparseable object, wrong object kind).
-                        // Keep its slot as a stand-in page rather than shrinking the page
-                        // count, matching readers (e.g. MuPDF) that render such a page
-                        // blank instead of dropping it — callers already treat a page
-                        // whose dictionary fails to load as blank/needing OCR.
-                        Err(_) => {
-                            return Some(kid_id);
-                        }
+                        self.kids = Some(kids);
+                    } else if !is_page && !is_pages && !dict.has(b"Kids") {
+                        // Missing or wrong /Type with no /Kids: treat it as a
+                        // leaf page instead of dropping the entry.
+                        return Some(kid_id);
+                    } else {
+                        return Some(kid_id);
                     }
                 }
             }
-
             // Current level exhausted, try to pop.
             if let kids @ Some(_) = self.stack.pop() {
                 self.kids = kids;
@@ -1111,9 +1232,15 @@ impl Iterator for PageTreeIter<'_> {
             .iter()
             .chain(self.stack.iter().flat_map(|k| k.iter()))
             .map(|kid| {
-                if let Ok(dict) = kid.as_reference().and_then(|id| self.doc.get_dictionary(id)) {
+                if let Ok(dict) = kid
+                    .as_reference()
+                    .and_then(|id| self.doc.get_dictionary(id))
+                {
                     if let Ok(b"Pages") = dict.get_type() {
-                        let count = dict.get_deref(b"Count", self.doc).and_then(Object::as_i64).unwrap_or(0);
+                        let count = dict
+                            .get_deref(b"Count", self.doc)
+                            .and_then(Object::as_i64)
+                            .unwrap_or(0);
                         // Don't let page count go backwards in case of an invalid document.
                         max(0, count) as usize
                     } else {

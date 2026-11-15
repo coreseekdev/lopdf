@@ -101,8 +101,8 @@ fn first_file_id(doc: &Document) -> Result<&[u8], DecryptionError> {
 // If the password string is less than 32 bytes long, pad it by appending the required number of
 // additional bytes from the beginning of the following padding string.
 const PAD_BYTES: [u8; 32] = [
-    0x28, 0xBF, 0x4E, 0x5E, 0x4E, 0x75, 0x8A, 0x41, 0x64, 0x00, 0x4E, 0x56, 0xFF, 0xFA, 0x01, 0x08, 0x2E, 0x2E, 0x00,
-    0xB6, 0xD0, 0x68, 0x3E, 0x80, 0x2F, 0x0C, 0xA9, 0xFE, 0x64, 0x53, 0x69, 0x7A,
+    0x28, 0xBF, 0x4E, 0x5E, 0x4E, 0x75, 0x8A, 0x41, 0x64, 0x00, 0x4E, 0x56, 0xFF, 0xFA, 0x01, 0x08,
+    0x2E, 0x2E, 0x00, 0xB6, 0xD0, 0x68, 0x3E, 0x80, 0x2F, 0x0C, 0xA9, 0xFE, 0x64, 0x53, 0x69, 0x7A,
 ];
 
 /// Truncate or pad `password` to exactly 32 bytes, filling from the start of
@@ -137,7 +137,10 @@ fn md5_key_length(algorithm: &PasswordAlgorithm) -> Result<usize, DecryptionErro
 /// times for revision 3 and above, where `n` is [`md5_key_length`]. This is the
 /// step shared by Algorithms 2, 3 and 7, which differ only in what they feed
 /// the resulting key to.
-fn hash_padded_password(algorithm: &PasswordAlgorithm, password: &[u8]) -> Result<Vec<u8>, DecryptionError> {
+fn hash_padded_password(
+    algorithm: &PasswordAlgorithm,
+    password: &[u8],
+) -> Result<Vec<u8>, DecryptionError> {
     let mut hasher = Md5::new();
     hasher.update(padded_password(password));
 
@@ -393,7 +396,9 @@ impl PasswordAlgorithm {
     ///
     /// This algorithm is deprecated in PDF 2.0.
     pub(crate) fn compute_file_encryption_key_r4<P>(
-        &self, doc: &Document, password: P,
+        &self,
+        doc: &Document,
+        password: P,
     ) -> Result<Vec<u8>, DecryptionError>
     where
         P: AsRef<[u8]>,
@@ -466,9 +471,12 @@ impl PasswordAlgorithm {
 
         // Algorithm 2.B over password + owner validation salt + U; a match with O means the
         // owner password.
-        if self.compute_hash(password, owner_validation_salt, Some(&self.user_value))? == hashed_owner_password {
+        if self.compute_hash(password, owner_validation_salt, Some(&self.user_value))?
+            == hashed_owner_password
+        {
             // Algorithm 2.B over password + owner key salt + U gives the key for /OE.
-            let key = aes256_key(&self.compute_hash(password, owner_key_salt, Some(&self.user_value))?);
+            let key =
+                aes256_key(&self.compute_hash(password, owner_key_salt, Some(&self.user_value))?);
 
             // Decrypt /OE with AES-256 CBC, zero IV, no padding: the result is the file key.
             let mut owner_encrypted = self.owner_encrypted.clone();
@@ -499,7 +507,12 @@ impl PasswordAlgorithm {
     /// Compute a hash (revision 6 and later).
     ///
     /// This implements Algorithm 2.B as described in ISO 32000-2:2020 (PDF 2.0).
-    fn compute_hash<P, S>(&self, password: P, salt: S, user_key: Option<&[u8]>) -> Result<Vec<u8>, DecryptionError>
+    fn compute_hash<P, S>(
+        &self,
+        password: P,
+        salt: S,
+        user_key: Option<&[u8]>,
+    ) -> Result<Vec<u8>, DecryptionError>
     where
         P: AsRef<[u8]>,
         S: AsRef<[u8]>,
@@ -526,8 +539,9 @@ impl PasswordAlgorithm {
             return Ok(k);
         }
 
-        let mut k1 =
-            Vec::with_capacity(64 * (password.len() + 64 + user_key.map(|user_key| user_key.len()).unwrap_or(0)));
+        let mut k1 = Vec::with_capacity(
+            64 * (password.len() + 64 + user_key.map(|user_key| user_key.len()).unwrap_or(0)),
+        );
 
         // Perform the following steps at least 64 times, until the value of the last byte in K is
         // less than or equal to (round number) - 32.
@@ -587,7 +601,9 @@ impl PasswordAlgorithm {
     ///
     /// This algorithm is deprecated in PDF 2.0.
     pub(crate) fn compute_hashed_owner_password_r4<O, U>(
-        &self, owner_password: Option<O>, user_password: U,
+        &self,
+        owner_password: Option<O>,
+        user_password: U,
     ) -> Result<Vec<u8>, DecryptionError>
     where
         O: AsRef<[u8]>,
@@ -625,7 +641,9 @@ impl PasswordAlgorithm {
     ///
     /// This algorithm is deprecated in PDF 2.0.
     pub(crate) fn compute_hashed_user_password_r2<U>(
-        &self, doc: &Document, user_password: U,
+        &self,
+        doc: &Document,
+        user_password: U,
     ) -> Result<Vec<u8>, DecryptionError>
     where
         U: AsRef<[u8]>,
@@ -647,7 +665,9 @@ impl PasswordAlgorithm {
     ///
     /// This algorithm is deprecated in PDF 2.0.
     pub(crate) fn compute_hashed_user_password_r3_r4<U>(
-        &self, doc: &Document, user_password: U,
+        &self,
+        doc: &Document,
+        user_password: U,
     ) -> Result<Vec<u8>, DecryptionError>
     where
         U: AsRef<[u8]>,
@@ -687,7 +707,11 @@ impl PasswordAlgorithm {
     /// This implements Algorithm 6 as described in ISO 32000-2:2020 (PDF 2.0).
     ///
     /// This algorithm is deprecated in PDF 2.0.
-    fn authenticate_user_password_r4<U>(&self, doc: &Document, user_password: U) -> Result<(), DecryptionError>
+    fn authenticate_user_password_r4<U>(
+        &self,
+        doc: &Document,
+        user_password: U,
+    ) -> Result<(), DecryptionError>
     where
         U: AsRef<[u8]>,
     {
@@ -720,11 +744,16 @@ impl PasswordAlgorithm {
     /// This implements Algorithm 7 as described in ISO 32000-2:2020 (PDF 2.0).
     ///
     /// This algorithm is deprecated in PDF 2.0.
-    fn authenticate_owner_password_r4<O>(&self, doc: &Document, owner_password: O) -> Result<(), DecryptionError>
+    fn authenticate_owner_password_r4<O>(
+        &self,
+        doc: &Document,
+        owner_password: O,
+    ) -> Result<(), DecryptionError>
     where
         O: AsRef<[u8]>,
     {
-        self.recover_user_password_r4(doc, owner_password).map(|_| ())
+        self.recover_user_password_r4(doc, owner_password)
+            .map(|_| ())
     }
 
     /// Recover the padded (32-byte) user password from the encryption
@@ -746,7 +775,9 @@ impl PasswordAlgorithm {
     /// recover and use the correct value instead — see
     /// [`crate::encryption::PasswordAlgorithm::resolve_password_for_key_derivation`].
     pub(crate) fn recover_user_password_r4<O>(
-        &self, doc: &Document, owner_password: O,
+        &self,
+        doc: &Document,
+        owner_password: O,
     ) -> Result<Vec<u8>, DecryptionError>
     where
         O: AsRef<[u8]>,
@@ -777,7 +808,9 @@ impl PasswordAlgorithm {
     ///
     /// This implements Algorithm 8 as described in ISO 32000-2:2020 (PDF 2.0).
     pub(crate) fn compute_hashed_user_password_r6<K, U>(
-        &self, file_encryption_key: K, user_password: U,
+        &self,
+        file_encryption_key: K,
+        user_password: U,
     ) -> Result<(Vec<u8>, Vec<u8>), DecryptionError>
     where
         K: AsRef<[u8]>,
@@ -795,7 +828,9 @@ impl PasswordAlgorithm {
     ///
     /// This implements Algorithm 9 as described in ISO 32000-2:2020 (PDF 2.0).
     pub(crate) fn compute_hashed_owner_password_r6<K, O>(
-        &self, file_encryption_key: K, owner_password: O,
+        &self,
+        file_encryption_key: K,
+        owner_password: O,
     ) -> Result<(Vec<u8>, Vec<u8>), DecryptionError>
     where
         K: AsRef<[u8]>,
@@ -817,7 +852,10 @@ impl PasswordAlgorithm {
     ///
     /// `user_key` is `/U` for the owner entry and absent for the user entry.
     fn compute_salted_value_r6(
-        &self, file_encryption_key: &[u8], password: &[u8], user_key: Option<&[u8]>,
+        &self,
+        file_encryption_key: &[u8],
+        password: &[u8],
+        user_key: Option<&[u8]>,
     ) -> Result<(Vec<u8>, Vec<u8>), DecryptionError> {
         let mut value = [0u8; 48];
         rand::rng().fill(&mut value[32..]);
@@ -840,7 +878,10 @@ impl PasswordAlgorithm {
     /// Compute the encryption dictionary's Perms (permissions) value (revision 6 and later).
     ///
     /// This implements Algorithm 10 as described in ISO 32000-2:2020 (PDF 2.0).
-    pub(crate) fn compute_permissions<K>(&self, file_encryption_key: K) -> Result<Vec<u8>, DecryptionError>
+    pub(crate) fn compute_permissions<K>(
+        &self,
+        file_encryption_key: K,
+    ) -> Result<Vec<u8>, DecryptionError>
     where
         K: AsRef<[u8]>,
     {
@@ -888,14 +929,21 @@ impl PasswordAlgorithm {
         O: AsRef<[u8]>,
     {
         // Algorithm 2.B over password + owner validation salt + U; a match with O is the owner password.
-        self.authenticate_password_r6(owner_password.as_ref(), &self.owner_value, Some(&self.user_value))
+        self.authenticate_password_r6(
+            owner_password.as_ref(),
+            &self.owner_value,
+            Some(&self.user_value),
+        )
     }
 
     /// Shared implementation of Algorithms 11 and 12: hash the password with
     /// `value`'s validation salt and compare against `value`'s leading 32
     /// bytes. `user_key` is `/U` for the owner entry and absent for the user one.
     fn authenticate_password_r6(
-        &self, password: &[u8], value: &[u8], user_key: Option<&[u8]>,
+        &self,
+        password: &[u8],
+        value: &[u8],
+        user_key: Option<&[u8]>,
     ) -> Result<(), DecryptionError> {
         let hash = self.compute_hash(truncate_password(password), &value[32..][..8], user_key)?;
 
@@ -951,7 +999,11 @@ impl PasswordAlgorithm {
     }
 
     /// Compute the file encryption key used to encrypt/decrypt the document.
-    pub fn compute_file_encryption_key<P>(&self, doc: &Document, password: P) -> Result<Vec<u8>, DecryptionError>
+    pub fn compute_file_encryption_key<P>(
+        &self,
+        doc: &Document,
+        password: P,
+    ) -> Result<Vec<u8>, DecryptionError>
     where
         P: AsRef<[u8]>,
     {
@@ -983,7 +1035,9 @@ impl PasswordAlgorithm {
     /// via the password hash directly — so the input passes through
     /// unchanged.
     pub fn resolve_password_for_key_derivation<P>(
-        &self, doc: &Document, password: P,
+        &self,
+        doc: &Document,
+        password: P,
     ) -> Result<Vec<u8>, DecryptionError>
     where
         P: AsRef<[u8]>,
@@ -1003,7 +1057,11 @@ impl PasswordAlgorithm {
     }
 
     /// Authenticate the owner password.
-    pub fn authenticate_user_password<U>(&self, doc: &Document, user_password: U) -> Result<(), DecryptionError>
+    pub fn authenticate_user_password<U>(
+        &self,
+        doc: &Document,
+        user_password: U,
+    ) -> Result<(), DecryptionError>
     where
         U: AsRef<[u8]>,
     {
@@ -1015,7 +1073,11 @@ impl PasswordAlgorithm {
     }
 
     /// Authenticate the owner password.
-    pub fn authenticate_owner_password<O>(&self, doc: &Document, owner_password: O) -> Result<(), DecryptionError>
+    pub fn authenticate_owner_password<O>(
+        &self,
+        doc: &Document,
+        owner_password: O,
+    ) -> Result<(), DecryptionError>
     where
         O: AsRef<[u8]>,
     {
@@ -1237,15 +1299,32 @@ mod tests {
             algorithm.owner_value = owner_value;
             algorithm.owner_encrypted = owner_encrypted;
 
-            algorithm.permission_encrypted = algorithm.compute_permissions(file_encryption_key).unwrap();
+            algorithm.permission_encrypted =
+                algorithm.compute_permissions(file_encryption_key).unwrap();
 
             // Assert that the correct passwords authenticate.
-            assert!(algorithm.authenticate_owner_password_r6(&owner_password).is_ok());
-            assert!(algorithm.authenticate_user_password_r6(&user_password).is_ok());
+            assert!(
+                algorithm
+                    .authenticate_owner_password_r6(&owner_password)
+                    .is_ok()
+            );
+            assert!(
+                algorithm
+                    .authenticate_user_password_r6(&user_password)
+                    .is_ok()
+            );
 
             // Assert that the swapped passwords do not authenticate.
-            assert!(algorithm.authenticate_owner_password_r6(&user_password).is_err());
-            assert!(algorithm.authenticate_user_password_r6(&owner_password).is_err());
+            assert!(
+                algorithm
+                    .authenticate_owner_password_r6(&user_password)
+                    .is_err()
+            );
+            assert!(
+                algorithm
+                    .authenticate_user_password_r6(&owner_password)
+                    .is_err()
+            );
 
             // Assert that the permissions validate correctly.
             assert!(algorithm.validate_permissions(file_encryption_key).is_ok());
@@ -1293,7 +1372,8 @@ mod tests {
         let encrypt_id = doc.add_object(encrypt_dict);
         doc.trailer.set("Encrypt", Object::Reference(encrypt_id));
 
-        let algo = PasswordAlgorithm::try_from(&doc).expect("should accept padded /O and /U longer than 48 bytes");
+        let algo = PasswordAlgorithm::try_from(&doc)
+            .expect("should accept padded /O and /U longer than 48 bytes");
 
         // Verify the values were truncated to the spec-required 48 bytes.
         assert_eq!(algo.owner_value.len(), 48);

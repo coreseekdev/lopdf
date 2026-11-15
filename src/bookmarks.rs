@@ -1,4 +1,4 @@
-use super::{Dictionary, Document, Error, Object, ObjectId};
+use super::{Dictionary, Document, Object, ObjectId};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -47,15 +47,20 @@ impl Document {
     }
 
     fn outline_child(
-        &self, maxid: &mut u32, parent: (ObjectId, &[u32]), processed: &mut HashMap<ObjectId, Dictionary>,
+        &self,
+        maxid: &mut u32,
+        parent: (ObjectId, &[u32]),
+        processed: &mut HashMap<ObjectId, Dictionary>,
     ) -> (Option<ObjectId>, Option<ObjectId>, i64) {
         let mut first: Option<ObjectId> = None;
         let mut last: Option<ObjectId> = None;
         let count = parent.1.len();
         for i in parent.1 {
             let mut child = Dictionary::new();
-            let id: ObjectId = (next_object_number(maxid), 0);
-            let info_id: ObjectId = (next_object_number(maxid), 0);
+            *maxid += 1;
+            let id: ObjectId = (*maxid, 0);
+            *maxid += 1;
+            let info_id: ObjectId = (*maxid, 0);
             let bookmark = self.bookmark_table.get(i).unwrap();
 
             let info = dictionary! {
@@ -99,7 +104,8 @@ impl Document {
             last = Some(id);
 
             if !bookmark.children.is_empty() {
-                let (c_first, c_last, c_count) = self.outline_child(maxid, (id, &bookmark.children[..]), processed);
+                let (c_first, c_last, c_count) =
+                    self.outline_child(maxid, (id, &bookmark.children[..]), processed);
 
                 if let Some(n) = c_first {
                     child.set("First", n);
@@ -119,19 +125,17 @@ impl Document {
         (first, last, count as i64)
     }
 
-    /// # Panics
-    ///
-    /// Panics if the outline needs object IDs past `u32::MAX`, as [`Document::new_object_id`]
-    /// does.
     pub fn build_outline(&mut self) -> Option<ObjectId> {
         let mut processed: HashMap<ObjectId, Dictionary> = HashMap::new();
 
         if !self.bookmarks.is_empty() {
             let mut outline = Dictionary::new();
             let mut maxid = self.max_id;
-            let id: ObjectId = (next_object_number(&mut maxid), 0);
+            maxid += 1;
+            let id: ObjectId = (maxid, 0);
 
-            let (first, last, count) = self.outline_child(&mut maxid, (id, &self.bookmarks[..]), &mut processed);
+            let (first, last, count) =
+                self.outline_child(&mut maxid, (id, &self.bookmarks[..]), &mut processed);
 
             if let Some(n) = first {
                 outline.set("First", n);
@@ -154,13 +158,4 @@ impl Document {
 
         None
     }
-}
-
-/// Advance `maxid` to the next object number, panicking as [`Document::new_object_id`] does
-/// rather than wrapping past `u32::MAX`.
-fn next_object_number(maxid: &mut u32) -> u32 {
-    *maxid = maxid
-        .checked_add(1)
-        .unwrap_or_else(|| panic!("{}", Error::ObjectIdOverflow));
-    *maxid
 }
