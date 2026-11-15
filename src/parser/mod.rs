@@ -1435,7 +1435,182 @@ fn operation(input: ParserInput) -> NomResult<Operation> {
 /// Parses one operation, filling `out` with its operands.  Reusing the
 /// caller's vector avoids a heap allocation per operation when a page is
 /// interpreted as a stream.
+#[inline]
+fn skip_token_space(input: ParserInput) -> ParserInput {
+    let count = input
+        .iter()
+        .take_while(|byte| is_whitespace(**byte))
+        .count();
+    &input[count..]
+}
+
+fn token_value(input: ParserInput, depth: usize) -> NomResult<Object> {
+    match input.first() {
+        Some(b'/') => map(name_pdf, Object::Name).parse(input),
+        Some(b'(') => map(literal_string_pdf, |string| {
+            Object::String(string, StringFormat::Literal)
+        })
+        .parse(input),
+        Some(b'<') => {
+            if input.get(1) == Some(&b'<') {
+                map(|i| token_dictionary(i, depth), Object::Dictionary).parse(input)
+            } else {
+                hexadecimal_string(input)
+            }
+        }
+        Some(b'[') => map(|i| token_array(i, depth), Object::Array).parse(input),
+        Some(b't') if input.starts_with(b"true") => {
+            Ok((&input[4..], Object::Boolean(true)))
+        }
+        Some(b'f') if input.starts_with(b"false") => {
+            Ok((&input[5..], Object::Boolean(false)))
+        }
+        Some(b'n') if input.starts_with(b"null") => Ok((&input[4..], Object::Null)),
+        Some(b'0'..=b'9' | b'+' | b'-' | b'.') => number(input),
+        _ => Err(nom::Err::Error(NomError::from_error_kind(
+            input,
+            ErrorKind::Alt,
+        ))),
+    }
+}
+
+fn token_array(input: ParserInput, depth: usize) -> NomResult<Vec<Object>> {
+    if depth == 0 {
+        return Err(nom::Err::Failure(NomError::from_error_kind(
+            input,
+            ErrorKind::TooLarge,
+        )));
+    }
+    let Some(rest) = input.strip_prefix(b"[") else {
+        return Err(nom::Err::Error(NomError::from_error_kind(
+            input,
+            ErrorKind::Tag,
+        )));
+    };
+    let mut rest = skip_token_space(rest);
+    let mut items = Vec::new();
+    loop {
+        if rest.starts_with(b"]") {
+            return Ok((&rest[1..], items));
+        }
+        if rest.is_empty() {
+            return Err(nom::Err::Error(NomError::from_error_kind(
+                rest,
+                ErrorKind::Tag,
+            )));
+        }
+        let (next, item) = token_value(rest, depth - 1)?;
+        items.push(item);
+        rest = skip_token_space(next);
+    }
+}
+
+fn token_dictionary(input: ParserInput, depth: usize) -> NomResult<Dictionary> {
+    if depth == 0 {
+        return Err(nom::Err::Failure(NomError::from_error_kind(
+            input,
+            ErrorKind::TooLarge,
+        )));
+    }
+    let Some(rest) = input.strip_prefix(b"<<") else {
+        return Err(nom::Err::Error(NomError::from_error_kind(
+            input,
+            ErrorKind::Tag,
+        )));
+    };
+    let mut rest = skip_token_space(rest);
+    let mut dict = Dictionary::with_capacity(4);
+    loop {
+        if rest.starts_with(b">>") {
+            return Ok((&rest[2..], dict));
+        }
+        let (next, key) = name_pdf(rest)?;
+        rest = skip_token_space(next);
+        let (next, value) = token_value(rest, depth - 1)?;
+        dict.set(key, value);
+        rest = skip_token_space(next);
+    }
+}
+
+fn token_operator(input: ParserInput) -> NomResult<Cow<'static, str>> {
+    let count = input
+        .iter()
+        .take_while(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(**byte, b'*' | b'\'' | b'"')
+        })
+        .count();
+    if count == 0 {
+        return Err(nom::Err::Error(NomError::from_error_kind(
+            input,
+            ErrorKind::TakeWhile1,
+        )));
+    }
+    let text = str::from_utf8(&input[..count]).unwrap();
+    Ok((&input[count..], intern_operator(text)))
+}
+
+fn token_operation<'a>(
+    input: ParserInput<'a>,
+    out: &mut Vec<Object>,
+) -> Option<NomResult<'a, Cow<'static, str>>> {
+    let mut rest = input;
+    while rest.first() == Some(&b'%') {
+        let end = rest
+            .iter()
+            .position(|byte| matches!(*byte, b'\r' | b'\n'))
+            .unwrap_or(rest.len());
+        rest = skip_token_space(&rest[end..]);
+    }
+    if rest.starts_with(b"BI")
+        && rest
+            .get(2)
+            .is_none_or(|byte| byte.is_ascii_whitespace())
+    {
+        return None;
+    }
+    out.clear();
+    loop {
+        rest = skip_token_space(rest);
+        let first = rest.first().copied()?;
+        let is_word = matches!(
+            first,
+            b'/' | b'(' | b'<' | b'[' | b'+' | b'-' | b'.' | b'0'..=b'9'
+        ) || (first == b't' && !rest.starts_with(b"T"))
+            || (first == b'f' && !rest.starts_with(b"f*") && rest.get(1) != Some(&b'*'))
+            || (first == b'n' && !rest.starts_with(b"n "));
+        if !is_word || (first == b'n' && !rest.starts_with(b"null")) {
+            let (next, operator) = match token_operator(rest) {
+                Ok(value) => value,
+                Err(error) => return Some(Err(error)),
+            };
+            return Some(Ok((skip_token_space(next), operator)));
+        }
+        let (next, value) = match token_value(rest, crate::reader::MAX_NESTING_DEPTH) {
+            Ok(value) => value,
+            Err(_) => {
+                let (next, operator) = match token_operator(rest) {
+                    Ok(value) => value,
+                    Err(error) => return Some(Err(error)),
+                };
+                return Some(Ok((skip_token_space(next), operator)));
+            }
+        };
+        out.push(value);
+        rest = next;
+    }
+}
+
 fn operation_into<'a>(
+    input: ParserInput<'a>,
+    out: &mut Vec<Object>,
+) -> NomResult<'a, Cow<'static, str>> {
+    match token_operation(input, out) {
+        Some(result) => result,
+        None => operation_into_nom(input, out),
+    }
+}
+
+fn operation_into_nom<'a>(
     input: ParserInput<'a>,
     out: &mut Vec<Object>,
 ) -> NomResult<'a, Cow<'static, str>> {
