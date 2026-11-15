@@ -108,6 +108,7 @@ fn is_regular(c: u8) -> bool {
     REGULAR[c as usize]
 }
 
+#[inline]
 fn space(input: ParserInput) -> NomResult<()> {
     let mut rest = input;
     loop {
@@ -297,6 +298,7 @@ pub(crate) fn hex_char(input: ParserInput) -> NomResult<u8> {
     .parse(input)
 }
 
+#[inline]
 pub(crate) fn name(input: ParserInput) -> NomResult<Vec<u8>> {
     let Some(rest) = input.strip_prefix(b"/") else {
         return Err(nom::Err::Error(NomError::from_error_kind(
@@ -348,6 +350,7 @@ pub(crate) fn name(input: ParserInput) -> NomResult<Vec<u8>> {
 /// Scans a literal string body starting just after `(`, appending decoded
 /// bytes.  Returns the consumed length including the closing `)` or the
 /// offset where parsing failed.
+#[inline]
 fn literal_body(
     input: ParserInput,
     depth: usize,
@@ -751,6 +754,7 @@ impl UnsignedToken for usize {
     }
 }
 
+#[inline]
 fn unsigned_int<I: UnsignedToken>(input: ParserInput) -> NomResult<I> {
     let bytes = input;
     let mut index = 0;
