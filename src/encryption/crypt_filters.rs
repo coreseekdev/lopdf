@@ -13,9 +13,39 @@ type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
 type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
 type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
 
+/// Per-object key material.  The longest key is AES-256; keeping the bytes
+/// inline avoids two heap allocations for every encrypted string or stream.
+#[derive(Clone, Copy, Debug)]
+pub struct ObjectKey {
+    bytes: [u8; 32],
+    len: u8,
+}
+
+impl ObjectKey {
+    fn new(bytes: &[u8]) -> Self {
+        let len = bytes.len().min(32);
+        let mut out = [0u8; 32];
+        out[..len].copy_from_slice(&bytes[..len]);
+        Self {
+            bytes: out,
+            len: len as u8,
+        }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
+    }
+}
+
+impl AsRef<[u8]> for ObjectKey {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
 pub trait CryptFilter: std::fmt::Debug + Send + Sync {
     fn method(&self) -> &[u8];
-    fn compute_key(&self, key: &[u8], obj_id: ObjectId) -> Result<Vec<u8>, DecryptionError>;
+    fn compute_key(&self, key: &[u8], obj_id: ObjectId) -> Result<ObjectKey, DecryptionError>;
     fn encrypt(&self, key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, DecryptionError>;
     fn decrypt(&self, key: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, DecryptionError>;
 }
@@ -28,8 +58,8 @@ impl CryptFilter for IdentityCryptFilter {
         b"Identity"
     }
 
-    fn compute_key(&self, key: &[u8], _obj_id: ObjectId) -> Result<Vec<u8>, DecryptionError> {
-        Ok(key.to_vec())
+    fn compute_key(&self, key: &[u8], _obj_id: ObjectId) -> Result<ObjectKey, DecryptionError> {
+        Ok(ObjectKey::new(key))
     }
 
     fn encrypt(&self, _key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, DecryptionError> {
@@ -42,21 +72,27 @@ impl CryptFilter for IdentityCryptFilter {
 }
 
 /// Extend the file key with the low-order 3 bytes of the object number and the
-/// low-order 2 bytes of the generation number, which is how every per-object
-/// key is seeded before hashing (Algorithms 1 and 2.B).
-fn key_with_object_number(key: &[u8], obj_id: ObjectId) -> Vec<u8> {
-    let mut builder = Vec::with_capacity(key.len() + 5);
-    builder.extend_from_slice(key);
-    builder.extend_from_slice(&obj_id.0.to_le_bytes()[..3]);
-    builder.extend_from_slice(&obj_id.1.to_le_bytes()[..2]);
-    builder
-}
+/// low-order 2 bytes of the generation number, hash it, and keep the first
+/// min(n + 5, 16) bytes.  `salt` adds the AES "sAlT" marker (Algorithm 1).
+fn md5_object_key(key: &[u8], obj_id: ObjectId, salt: bool) -> ObjectKey {
+    let mut extended = [0u8; 48];
+    let mut len = key.len();
+    extended[..len].copy_from_slice(key);
+    extended[len..len + 3].copy_from_slice(&obj_id.0.to_le_bytes()[..3]);
+    extended[len + 3..len + 5].copy_from_slice(&obj_id.1.to_le_bytes()[..2]);
+    len += 5;
+    if salt {
+        extended[len..len + 4].copy_from_slice(b"sAlT");
+        len += 4;
+    }
 
-/// The per-object key is the first min(n + 5, 16) bytes of the MD5 of the
-/// extended file key, where n is the file key's length.
-fn md5_object_key(extended_key: &[u8], file_key_len: usize) -> Vec<u8> {
-    let key_len = (file_key_len + 5).min(16);
-    Md5::digest(extended_key)[..key_len].to_vec()
+    let key_len = (key.len() + 5).min(16);
+    let mut bytes = [0u8; 32];
+    bytes[..key_len].copy_from_slice(&Md5::digest(&extended[..len])[..key_len]);
+    ObjectKey {
+        bytes,
+        len: key_len as u8,
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -67,19 +103,16 @@ impl CryptFilter for Rc4CryptFilter {
         b"V2"
     }
 
-    fn compute_key(&self, key: &[u8], obj_id: ObjectId) -> Result<Vec<u8>, DecryptionError> {
-        Ok(md5_object_key(
-            &key_with_object_number(key, obj_id),
-            key.len(),
-        ))
+    fn compute_key(&self, key: &[u8], obj_id: ObjectId) -> Result<ObjectKey, DecryptionError> {
+        Ok(md5_object_key(key, obj_id, false))
     }
 
     fn encrypt(&self, key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, DecryptionError> {
-        Ok(with_cached_rc4(key, |rc4| rc4.encrypt(plaintext)))
+        Ok(with_cached_rc4(key, |state| Rc4::encrypt_state(state, plaintext)))
     }
 
     fn decrypt(&self, key: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, DecryptionError> {
-        Ok(with_cached_rc4(key, |rc4| rc4.decrypt(ciphertext)))
+        Ok(with_cached_rc4(key, |state| Rc4::decrypt_state(state, ciphertext)))
     }
 }
 
@@ -102,7 +135,7 @@ macro_rules! aes_cbc_crypt_filter {
                 &self,
                 key: &[u8],
                 obj_id: ObjectId,
-            ) -> Result<Vec<u8>, DecryptionError> {
+            ) -> Result<ObjectKey, DecryptionError> {
                 $compute_key(key, obj_id)
             }
 
@@ -185,19 +218,14 @@ macro_rules! aes_cbc_crypt_filter {
 /// Algorithm 1: extend the file key with the object number and generation,
 /// then, for AES, with the "sAlT" marker, and take the first min(n + 5, 16)
 /// bytes of the MD5 as the key.
-fn aes128_compute_key(key: &[u8], obj_id: ObjectId) -> Result<Vec<u8>, DecryptionError> {
-    let mut builder = key_with_object_number(key, obj_id);
-
-    // If using the AES algorithm, extend the file encryption key an additional 4 bytes by
-    // adding the value "sAlT".
-    builder.extend_from_slice(b"sAlT");
-
-    Ok(md5_object_key(&builder, key.len()))
+fn aes128_compute_key(key: &[u8], obj_id: ObjectId) -> Result<ObjectKey, DecryptionError> {
+    // Algorithm 1 extends the file key with "sAlT" before the hash.
+    Ok(md5_object_key(key, obj_id, true))
 }
 
 /// Algorithm 2.B: the 32-byte file encryption key is already the AES-256 key.
-fn aes256_compute_key(key: &[u8], _obj_id: ObjectId) -> Result<Vec<u8>, DecryptionError> {
-    Ok(key.to_vec())
+fn aes256_compute_key(key: &[u8], _obj_id: ObjectId) -> Result<ObjectKey, DecryptionError> {
+    Ok(ObjectKey::new(key))
 }
 
 aes_cbc_crypt_filter!(
@@ -218,24 +246,25 @@ aes_cbc_crypt_filter!(
 );
 
 thread_local! {
-    static LAST_RC4: std::cell::RefCell<Option<(Vec<u8>, [u8; 256])>> =
+    static LAST_RC4: std::cell::RefCell<Option<(ObjectKey, [u8; 256])>> =
         const { std::cell::RefCell::new(None) };
 }
 
 /// Many objects contain several strings that share one per-object key; reuse
-/// the KSA state while the recursion visits them.
-fn with_cached_rc4<T>(key: &[u8], transform: impl FnOnce(&Rc4) -> T) -> T {
+/// the KSA state while the recursion visits them.  The cached key lives inline,
+/// and the scratch state is copied only once per payload.
+fn with_cached_rc4<T>(key: &[u8], transform: impl FnOnce(&mut [u8; 256]) -> T) -> T {
     LAST_RC4.with(|cache| {
         let mut cache = cache.borrow_mut();
-        let state = match cache.as_ref() {
-            Some((cached_key, state)) if cached_key == key => *state,
+        let mut state = match cache.as_ref() {
+            Some((cached_key, state)) if cached_key.as_slice() == key => *state,
             _ => {
                 let rc4 = Rc4::new(key);
                 let state = rc4.initial_state();
-                *cache = Some((key.to_vec(), state));
+                *cache = Some((ObjectKey::new(key), state));
                 state
             }
         };
-        transform(&Rc4::from_state(state))
+        transform(&mut state)
     })
 }

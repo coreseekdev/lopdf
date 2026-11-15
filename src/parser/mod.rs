@@ -562,7 +562,7 @@ fn dictionary_key(input: ParserInput) -> NomResult<'_, PdfName> {
 fn inner_dictionary(depth: usize) -> impl Fn(ParserInput) -> NomResult<Dictionary> {
     move |input| {
         let mut rest = input;
-        let mut dict = Dictionary::with_capacity(4);
+        let mut dict = Dictionary::builder(4);
         loop {
             let (next, _) = space(rest)?;
             rest = next;
@@ -573,7 +573,7 @@ fn inner_dictionary(depth: usize) -> impl Fn(ParserInput) -> NomResult<Dictionar
                         .get(2)
                         .is_some_and(|byte| byte.is_ascii_whitespace()))
             {
-                return Ok((rest, dict));
+                return Ok((rest, dict.finish()));
             }
             let (next, key) = dictionary_key(rest)?;
             let (next, _) = space(next)?;
@@ -897,13 +897,13 @@ fn direct_dictionary(input: ParserInput, depth: usize) -> NomResult<Dictionary> 
         )));
     };
     let mut rest = space(rest)?.0;
-    let mut dict = Dictionary::with_capacity(4);
+    let mut dict = Dictionary::builder(4);
     loop {
         if rest.starts_with(b">>") {
-            return Ok((&rest[2..], dict));
+            return Ok((&rest[2..], dict.finish()));
         }
         if rest.starts_with(b"endobj") {
-            return Ok((rest, dict));
+            return Ok((rest, dict.finish()));
         }
         let (next, key) = name_pdf(rest)?;
         let (next, _) = space(next)?;
@@ -1571,10 +1571,10 @@ fn token_dictionary(input: ParserInput, depth: usize) -> NomResult<Dictionary> {
         )));
     };
     let mut rest = skip_token_space(rest);
-    let mut dict = Dictionary::with_capacity(4);
+    let mut dict = Dictionary::builder(4);
     loop {
         if rest.starts_with(b">>") {
-            return Ok((&rest[2..], dict));
+            return Ok((&rest[2..], dict.finish()));
         }
         let (next, key) = name_pdf(rest)?;
         rest = skip_token_space(next);

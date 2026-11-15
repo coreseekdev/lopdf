@@ -680,7 +680,10 @@ pub struct Reader<'a> {
     pub buffer: Cow<'a, [u8]>,
     pub document: Document,
     pub encryption_state: Option<EncryptionState>,
-    pub raw_objects: BTreeMap<ObjectId, Vec<u8>>, // Store raw bytes for encrypted objects
+    /// Byte ranges `(id, start, end)` of encrypted direct objects.  The bytes
+    /// stay in `buffer`; copying each object out would duplicate the whole
+    /// file and allocate once per object before decryption even starts.
+    pub raw_objects: Vec<(ObjectId, usize, usize)>,
     pub password: Option<String>,                 // Password for encrypted PDFs
     pub strict: bool,                             // Reject non-conforming PDFs when true
     /// Maximum decompressed size, in bytes, allowed for any single stream
@@ -845,7 +848,7 @@ impl<'a> Reader<'a> {
             buffer: Cow::Borrowed(buffer),
             document: Document::new(),
             encryption_state: None,
-            raw_objects: BTreeMap::new(),
+            raw_objects: Vec::new(),
             password: options.password,
             strict: options.strict,
             max_decompressed_size: options.max_decompressed_size,
@@ -1613,8 +1616,8 @@ impl<'a> Reader<'a> {
         for (obj_num, entry) in entries {
             match entry {
                 XrefEntry::Normal { offset, .. } => {
-                    if let Ok((obj_id, raw_bytes)) = self.extract_raw_object(offset as usize) {
-                        self.raw_objects.insert(obj_id, raw_bytes);
+                    if let Ok((obj_id, start, end)) = self.extract_raw_object(offset as usize) {
+                        self.raw_objects.push((obj_id, start, end));
                     }
                 }
                 XrefEntry::Compressed { container, index } => {
@@ -1641,15 +1644,18 @@ impl<'a> Reader<'a> {
                 .ok()
                 .and_then(|o| o.as_reference().ok());
 
-            for (obj_id, raw_bytes) in &self.raw_objects {
+            for (obj_id, start, end) in std::mem::take(&mut self.raw_objects) {
                 if let Some(enc_ref) = encrypt_ref
-                    && *obj_id == enc_ref
+                    && obj_id == enc_ref
                 {
                     continue;
                 }
+                let Some(raw_bytes) = self.buffer.get(start..end) else {
+                    continue;
+                };
 
                 if let Ok((id, mut obj)) = self.parse_raw_object(raw_bytes) {
-                    let _ = encryption::decrypt_object(state, *obj_id, &mut obj);
+                    let _ = encryption::decrypt_object(state, obj_id, &mut obj);
                     self.document.objects.insert(id, obj);
                 }
             }
@@ -2290,7 +2296,9 @@ impl<'a> Reader<'a> {
                 // window-aware resolver.
                 let encrypt_obj = self.get_object(encrypt_ref, &mut HashSet::new())?;
                 self.document.objects.insert(encrypt_ref, encrypt_obj);
-            } else if let Some(raw_bytes) = self.raw_objects.get(&encrypt_ref)
+            } else if let Some(&(_, start, end)) =
+                self.raw_objects.iter().find(|(id, _, _)| *id == encrypt_ref)
+                && let Some(raw_bytes) = self.buffer.get(start..end)
                 && let Ok((_, obj)) = self.parse_raw_object(raw_bytes)
             {
                 self.document.objects.insert(encrypt_ref, obj);
@@ -2363,7 +2371,7 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
-    fn extract_raw_object(&mut self, offset: usize) -> Result<(ObjectId, Vec<u8>)> {
+    fn extract_raw_object(&mut self, offset: usize) -> Result<(ObjectId, usize, usize)> {
         if offset > self.buffer.len() {
             return Err(Error::InvalidOffset(offset));
         }
@@ -2398,10 +2406,9 @@ impl<'a> Reader<'a> {
             return Err(Error::Parse(ParseError::InvalidXref));
         }
 
-        // Extract raw object bytes (including header and trailer)
-        let raw_bytes = slice[0..end_pos].to_vec();
-
-        Ok(((obj_num, obj_gen), raw_bytes))
+        // Keep the byte range in the reader's buffer instead of copying the
+        // object; the parser can borrow it again after encryption is set up.
+        Ok(((obj_num, obj_gen), offset, offset + end_pos))
     }
 
     fn read_object(
@@ -3559,11 +3566,10 @@ fn scan_number<N: std::str::FromStr>(input: &[u8], mut pos: usize) -> Result<(N,
 
 /// The first index at or after `start` where `pattern` begins, or `None`.
 fn find_from(input: &[u8], start: usize, pattern: &[u8]) -> Option<usize> {
-    input
-        .get(start..)?
-        .windows(pattern.len())
-        .position(|window| window == pattern)
-        .map(|pos| start + pos)
+    // `endstream`/`endobj`/`/Length` scans are the only whole-file byte
+    // searches on the load path; memchr's SIMD prefilter replaces the naive
+    // window-by-window comparison.
+    memchr::memmem::find(input.get(start..)?, pattern).map(|pos| start + pos)
 }
 
 #[cfg(all(test, not(feature = "async")))]

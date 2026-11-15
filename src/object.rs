@@ -74,7 +74,7 @@ pub struct Dictionary(Arc<DictRepr>);
 const DICT_INLINE_MAX: usize = 8;
 
 #[derive(Debug, Clone, PartialEq)]
-enum DictRepr {
+pub(crate) enum DictRepr {
     Inline(Vec<(PdfName, Object)>),
     Map(ObjectMap),
 }
@@ -663,6 +663,42 @@ impl fmt::Debug for Object {
     }
 }
 
+/// Owner-exclusive dictionary used while parsing.  See [`Dictionary::builder`].
+pub(crate) struct DictionaryBuilder {
+    repr: DictRepr,
+}
+
+impl DictionaryBuilder {
+    pub(crate) fn set(&mut self, key: PdfName, value: Object) {
+        match &mut self.repr {
+            DictRepr::Inline(entries) => {
+                if let Some((_, slot)) = entries.iter_mut().find(|(name, _)| *name == key) {
+                    *slot = value;
+                    return;
+                }
+                if entries.len() < DICT_INLINE_MAX {
+                    entries.push((key, value));
+                    return;
+                }
+                let mut map =
+                    ObjectMap::with_capacity_and_hasher(entries.len() + 1, FxBuildHasher);
+                for (key, value) in entries.drain(..) {
+                    map.insert(key, value);
+                }
+                map.insert(key, value);
+                self.repr = DictRepr::Map(map);
+            }
+            DictRepr::Map(map) => {
+                map.insert(key, value);
+            }
+        }
+    }
+
+    pub(crate) fn finish(self) -> Dictionary {
+        Dictionary(Arc::new(self.repr))
+    }
+}
+
 impl Dictionary {
     pub fn new() -> Dictionary {
         static EMPTY: std::sync::OnceLock<Arc<DictRepr>> = std::sync::OnceLock::new();
@@ -679,6 +715,24 @@ impl Dictionary {
                 capacity,
                 FxBuildHasher,
             ))))
+        }
+    }
+
+    /// Start a dictionary that the caller owns exclusively until [`finish`].
+    ///
+    /// The parser inserts every entry of every object through this builder:
+    /// unlike [`Dictionary::set`], each insertion needs no `Arc::make_mut`
+    /// uniqueness check, and only the completed dictionary is put behind an
+    /// `Arc`.  Duplicate keys keep last-wins semantics.
+    ///
+    /// [`finish`]: DictionaryBuilder::finish
+    pub(crate) fn builder(capacity: usize) -> DictionaryBuilder {
+        DictionaryBuilder {
+            repr: if capacity <= DICT_INLINE_MAX {
+                DictRepr::Inline(Vec::with_capacity(capacity))
+            } else {
+                DictRepr::Map(ObjectMap::with_capacity_and_hasher(capacity, FxBuildHasher))
+            },
         }
     }
 
@@ -1195,7 +1249,14 @@ impl Stream {
 
     pub fn set_content(&mut self, content: Vec<u8>) {
         self.content = content;
-        self.dict.set("Length", self.content.len() as i64);
+        // Decryption only rewrites the payload, so `/Length` usually already
+        // matches.  Skip the dictionary write in that case: an interned
+        // dictionary is shared, and `Dictionary::set` would deep-clone it on
+        // every stream just to store the same integer again.
+        let length = self.content.len() as i64;
+        if self.dict.get_opt(b"Length").and_then(|value| value.as_i64().ok()) != Some(length) {
+            self.dict.set("Length", length);
+        }
     }
 
     pub fn set_plain_content(&mut self, content: Vec<u8>) {
@@ -1516,41 +1577,52 @@ impl Stream {
     }
 
     fn zlib_rs_inflate(input: &[u8], zlib_header: bool, limit: Option<usize>) -> Vec<u8> {
+        use std::cell::RefCell;
         use zlib_rs::{Inflate, InflateFlush, Status};
 
-        let mut inflater = Inflate::new(zlib_header, 15);
-        let mut output = Vec::with_capacity(initial_capacity(input.len(), limit));
-        let mut chunk = vec![0u8; 64 * 1024];
-        let mut consumed = 0usize;
-        loop {
-            let before_in = inflater.total_in();
-            let before_out = inflater.total_out();
-            let remaining = limit.map_or(usize::MAX, |max| max.saturating_sub(output.len()));
-            let chunk_len = chunk.len().min(remaining.saturating_add(1)).max(1);
-            let status = match inflater.decompress(
-                &input[consumed..],
-                &mut chunk[..chunk_len],
-                InflateFlush::NoFlush,
-            ) {
-                Ok(status) => status,
-                // Keep bytes produced before a corrupt tail; the previous
-                // Read adapter did the same for lenient page streams.
-                Err(_) => break,
-            };
-            consumed += (inflater.total_in() - before_in) as usize;
-            let produced = (inflater.total_out() - before_out) as usize;
-            output.extend_from_slice(&chunk[..produced]);
-            if status == Status::StreamEnd
-                || (produced == 0 && consumed == input.len())
-                || consumed >= input.len()
-            {
-                break;
-            }
-            if limit.is_some_and(|max| output.len() > max) {
-                break;
-            }
+        // A page's content and font streams are inflated one after another on
+        // the same thread.  Reusing one chunk avoids a 64 KiB allocation plus
+        // zeroing for every stream; the inflater overwrites the bytes it
+        // reports before they are read.
+        thread_local! {
+            static CHUNK: RefCell<Vec<u8>> = RefCell::new(vec![0u8; 64 * 1024]);
         }
-        output
+
+        CHUNK.with(|chunk| {
+            let mut chunk = chunk.borrow_mut();
+            let mut inflater = Inflate::new(zlib_header, 15);
+            let mut output = Vec::with_capacity(initial_capacity(input.len(), limit));
+            let mut consumed = 0usize;
+            loop {
+                let before_in = inflater.total_in();
+                let before_out = inflater.total_out();
+                let remaining = limit.map_or(usize::MAX, |max| max.saturating_sub(output.len()));
+                let chunk_len = chunk.len().min(remaining.saturating_add(1)).max(1);
+                let status = match inflater.decompress(
+                    &input[consumed..],
+                    &mut chunk[..chunk_len],
+                    InflateFlush::NoFlush,
+                ) {
+                    Ok(status) => status,
+                    // Keep bytes produced before a corrupt tail; the previous
+                    // Read adapter did the same for lenient page streams.
+                    Err(_) => break,
+                };
+                consumed += (inflater.total_in() - before_in) as usize;
+                let produced = (inflater.total_out() - before_out) as usize;
+                output.extend_from_slice(&chunk[..produced]);
+                if status == Status::StreamEnd
+                    || (produced == 0 && consumed == input.len())
+                    || consumed >= input.len()
+                {
+                    break;
+                }
+                if limit.is_some_and(|max| output.len() > max) {
+                    break;
+                }
+            }
+            output
+        })
     }
 
     fn decode_ascii85(input: &[u8], limit: Option<usize>) -> Result<Vec<u8>> {

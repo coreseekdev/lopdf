@@ -977,8 +977,8 @@ fn transform_object(
     let key = crypt_filter.compute_key(&state.file_encryption_key, obj_id)?;
 
     let transformed = match direction {
-        Direction::Encrypt => crypt_filter.encrypt(&key, payload)?,
-        Direction::Decrypt => crypt_filter.decrypt(&key, payload)?,
+        Direction::Encrypt => crypt_filter.encrypt(key.as_slice(), payload)?,
+        Direction::Decrypt => crypt_filter.decrypt(key.as_slice(), payload)?,
     };
 
     // Store the result in the object.
