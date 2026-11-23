@@ -29,6 +29,31 @@ impl Content<Vec<Operation>> {
         parser::ContentOperations::new(data)
     }
 
+    /// Decode content operations, resolving each inline image's
+    /// `/ColorSpace` with `resolver` before the image data is sized.
+    ///
+    /// The resolver is called once per inline image, in stream order, with
+    /// the image dictionary's `/CS` value (`Object::Null` when the entry is
+    /// absent or the image is an image mask).  Returning the component count
+    /// lets an inline image name a colour space in the resource dictionary,
+    /// which the built-in device and `/Indexed` rules cannot size.
+    pub fn decode_with_inline_colorspaces(
+        data: &[u8],
+        resolver: &dyn Fn(&Object) -> Option<usize>,
+    ) -> Result<Self> {
+        parser::content_with_inline_colorspaces(data, resolver)
+            .ok_or(ParseError::InvalidContentStream.into())
+    }
+
+    /// [`Content::decode_with_inline_colorspaces`] without collecting the
+    /// operations, yielding them one at a time like [`Content::decode_iter`].
+    pub fn decode_iter_with_inline_colorspaces<'a>(
+        data: &'a [u8],
+        resolver: &'a dyn Fn(&Object) -> Option<usize>,
+    ) -> parser::ContentOperations<'a> {
+        parser::ContentOperations::with_resolver(data, resolver)
+    }
+
     /// Strict decode content operations.
     pub fn decode_strict(data: &[u8]) -> Result<Self> {
         parser::content_strict(data).map_err(|e| e.into())

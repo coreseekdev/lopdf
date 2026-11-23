@@ -1467,7 +1467,7 @@ fn skip_content_space(input: ParserInput) -> ParserInput {
 
 fn operation(input: ParserInput) -> NomResult<Operation> {
     let mut operands = Vec::new();
-    let (rest, operator) = operation_into(input, &mut operands)?;
+    let (rest, operator) = operation_into(input, &mut operands, None)?;
     Ok((
         rest,
         Operation {
@@ -1655,16 +1655,18 @@ fn token_operation<'a>(
 fn operation_into<'a>(
     input: ParserInput<'a>,
     out: &mut Vec<Object>,
+    resolver: Option<InlineColorspaceResolver<'_>>,
 ) -> NomResult<'a, Cow<'static, str>> {
     match token_operation(input, out) {
         Some(result) => result,
-        None => operation_into_nom(input, out),
+        None => operation_into_nom(input, out, resolver),
     }
 }
 
 fn operation_into_nom<'a>(
     input: ParserInput<'a>,
     out: &mut Vec<Object>,
+    resolver: Option<InlineColorspaceResolver<'_>>,
 ) -> NomResult<'a, Cow<'static, str>> {
     let mut rest = input;
     // A comment consumes its end-of-line marker, so also skip any white space
@@ -1677,7 +1679,7 @@ fn operation_into_nom<'a>(
             Err(error) => return Err(error),
         }
     }
-    match inline_image(rest) {
+    match inline_image(rest, resolver) {
         Ok((rest, (mut operands, operator))) => {
             out.clear();
             out.append(&mut operands);
@@ -1726,7 +1728,10 @@ fn operation_into_nom<'a>(
     Ok((rest, operator))
 }
 
-fn inline_image(input: ParserInput) -> NomResult<(Vec<Object>, Cow<'static, str>)> {
+fn inline_image<'a>(
+    input: ParserInput<'a>,
+    resolver: Option<InlineColorspaceResolver<'_>>,
+) -> NomResult<'a, (Vec<Object>, Cow<'static, str>)> {
     let rest = input
         .strip_prefix(b"BI")
         .ok_or_else(|| ParseErr::Error(NomError::from_error_kind(input, ErrorKind::Tag)))?;
@@ -1737,7 +1742,7 @@ fn inline_image(input: ParserInput) -> NomResult<(Vec<Object>, Cow<'static, str>
             ErrorKind::Eof,
         )));
     }
-    inline_image_impl(rest)
+    inline_image_impl(rest, resolver)
 }
 
 /// The single white-space character between `ID` and the image data (ISO 32000-2, 8.9.7),
@@ -1753,13 +1758,38 @@ fn inline_image_data_separator(input: ParserInput) -> NomResult<()> {
     Ok((input, ()))
 }
 
-fn inline_image_impl(input: ParserInput) -> NomResult<(Vec<Object>, Cow<'static, str>)> {
+fn inline_image_impl<'a>(
+    input: ParserInput<'a>,
+    resolver: Option<InlineColorspaceResolver<'_>>,
+) -> NomResult<'a, (Vec<Object>, Cow<'static, str>)> {
     let (input, stream_dict) = inner_dictionary(crate::reader::MAX_NESTING_DEPTH)(input)?;
+    // The resolver runs once per image, before the data is sized: the
+    // component count decides where the data ends.  An image mask has no
+    // colour space of its own (its /CS entry is ignored, ISO 32000-1 8.9.7),
+    // so the resolver sees a null object and the one-component rule applies.
+    let image_mask = matches!(
+        stream_dict
+            .get(b"IM")
+            .or_else(|_| stream_dict.get(b"ImageMask")),
+        Ok(Object::Boolean(true))
+    );
+    let resolved_colors = resolver.and_then(|resolve| {
+        let colorspace = if image_mask {
+            Object::Null
+        } else {
+            stream_dict
+                .get(b"CS")
+                .or_else(|_| stream_dict.get(b"ColorSpace"))
+                .cloned()
+                .unwrap_or(Object::Null)
+        };
+        resolve(&colorspace)
+    });
     let input = input
         .strip_prefix(b"ID")
         .ok_or_else(|| ParseErr::Error(NomError::from_error_kind(input, ErrorKind::Tag)))?;
     let (input, _) = inline_image_data_separator(input)?;
-    match image_data_stream(input, stream_dict) {
+    match image_data_stream(input, stream_dict, resolved_colors) {
         Ok((input, stream)) => {
             let input = skip_content_space(input);
             let input = input
@@ -1794,6 +1824,7 @@ fn inline_image_impl(input: ParserInput) -> NomResult<(Vec<Object>, Cow<'static,
 fn image_data_stream(
     input: ParserInput,
     stream_dict: Dictionary,
+    resolved_colors: Option<usize>,
 ) -> crate::Result<(ParserInput, Stream)> {
     let get_abbr =
         |key_abbr: &[u8], key: &[u8]| stream_dict.get(key_abbr).or_else(|_| stream_dict.get(key));
@@ -1811,32 +1842,38 @@ fn image_data_stream(
     } else {
         Some(get_abbr(b"CS", b"ColorSpace")?.clone())
     };
-    let num_colors = match &colorspace {
-        None => 1,
-        Some(Object::Array(array))
-            if matches!(
-                array.first().map(Object::as_name),
-                Some(Ok(b"Indexed" | b"I"))
-            ) =>
-        {
-            1
+    // A caller-supplied resolver knows the resource dictionary and the full
+    // colour-space grammar, so its count wins over the names below.
+    let num_colors = if let Some(count) = resolved_colors.filter(|&count| count > 0) {
+        count
+    } else {
+        match &colorspace {
+            None => 1,
+            Some(Object::Array(array))
+                if matches!(
+                    array.first().map(Object::as_name),
+                    Some(Ok(b"Indexed" | b"I"))
+                ) =>
+            {
+                1
+            }
+            Some(colorspace) => match colorspace.as_name()? {
+                b"DeviceGray" | b"G" | b"Gray" => 1,
+                b"DeviceRGB" | b"RGB" => 3,
+                b"DeviceRGBA" | b"RGBA" => 4,
+                b"DeviceCMYK" | b"CMYK" => 4,
+                b"Pattern" => {
+                    log::warn!("Pattern colorspace is not allowed in inline images");
+                    return Err(Error::InvalidInlineImage(String::from(
+                        "Pattern colorspace is not allowed in inline images",
+                    )));
+                }
+                _ => {
+                    log::warn!("Colorspace of inline image not recognized / not yet implemented");
+                    return Err(Error::Unimplemented("inline image colorspaces"));
+                }
+            },
         }
-        Some(colorspace) => match colorspace.as_name()? {
-            b"DeviceGray" | b"G" | b"Gray" => 1,
-            b"DeviceRGB" | b"RGB" => 3,
-            b"DeviceRGBA" | b"RGBA" => 4,
-            b"DeviceCMYK" | b"CMYK" => 4,
-            b"Pattern" => {
-                log::warn!("Pattern colorspace is not allowed in inline images");
-                return Err(Error::InvalidInlineImage(String::from(
-                    "Pattern colorspace is not allowed in inline images",
-                )));
-            }
-            _ => {
-                log::warn!("Colorspace of inline image not recognized / not yet implemented");
-                return Err(Error::Unimplemented("inline image colorspaces"));
-            }
-        },
     };
 
     let length = bpc
@@ -1980,13 +2017,16 @@ fn skip_trailing_content_space(mut rest: ParserInput) -> ParserInput {
     }
 }
 
-fn _content(input: ParserInput) -> NomResult<Content<Vec<Operation>>> {
+fn _content<'a>(
+    input: ParserInput<'a>,
+    resolver: Option<InlineColorspaceResolver<'_>>,
+) -> NomResult<'a, Content<Vec<Operation>>> {
     let mut rest = input;
     let mut operations = Vec::with_capacity(input.len() / 32);
     let mut operands = Vec::new();
     loop {
         let len = rest.len();
-        match operation_into(rest, &mut operands) {
+        match operation_into(rest, &mut operands, resolver) {
             Ok((next, operator)) => {
                 if next.len() == len {
                     return Err(ParseErr::Error(NomError::from_error_kind(
@@ -2010,7 +2050,28 @@ fn _content(input: ParserInput) -> NomResult<Content<Vec<Operation>>> {
 
 
 pub fn content(input: ParserInput) -> Option<Content<Vec<Operation>>> {
-    strip_nom(_content(input))
+    strip_nom(_content(input, None))
+}
+
+/// Resolves an inline image's `/ColorSpace` value to its component count.
+///
+/// See [`content_with_inline_colorspaces`].
+pub type InlineColorspaceResolver<'a> = &'a dyn Fn(&Object) -> Option<usize>;
+
+/// [`content`] with an explicit resolver for inline-image colour spaces.
+///
+/// The resolver is called once for every `BI` in stream order, with that
+/// image's `/CS` (or `/ColorSpace`) value, before the image data is sized.
+/// Its component count decides how many bytes the data occupies, and lets an
+/// inline image name a colour space in the resource dictionary instead of
+/// only a device space (`image_data_stream` rejects every other name).
+/// `None` from the resolver falls back to the built-in device and `/Indexed`
+/// rules.
+pub fn content_with_inline_colorspaces<'a>(
+    input: ParserInput<'a>,
+    resolver: InlineColorspaceResolver<'a>,
+) -> Option<Content<Vec<Operation>>> {
+    strip_nom(_content(input, Some(resolver)))
 }
 
 /// The operations of a content stream, decoded one at a time with the grammar of
@@ -2022,6 +2083,8 @@ pub struct ContentOperations<'a> {
     input: ParserInput<'a>,
     started: bool,
     finished: bool,
+    /// See [`content_with_inline_colorspaces`].
+    resolver: Option<InlineColorspaceResolver<'a>>,
 }
 
 impl<'a> ContentOperations<'a> {
@@ -2030,6 +2093,19 @@ impl<'a> ContentOperations<'a> {
             input,
             started: false,
             finished: false,
+            resolver: None,
+        }
+    }
+
+    pub(crate) fn with_resolver(
+        input: ParserInput<'a>,
+        resolver: InlineColorspaceResolver<'a>,
+    ) -> Self {
+        ContentOperations {
+            input,
+            started: false,
+            finished: false,
+            resolver: Some(resolver),
         }
     }
 
@@ -2059,7 +2135,7 @@ impl<'a> ContentOperations<'a> {
             }
         }
         let len = self.input.len();
-        match operation_into(self.input, operands) {
+        match operation_into(self.input, operands, self.resolver) {
             Ok((input, operator)) => {
                 if input.len() == len {
                     self.finished = true;
@@ -2096,7 +2172,7 @@ impl Iterator for ContentOperations<'_> {
         }
         let len = self.input.len();
         let mut operands = Vec::new();
-        match operation_into(self.input, &mut operands) {
+        match operation_into(self.input, &mut operands, self.resolver) {
             Ok((input, operator)) if input.len() == len => self.fail(),
             Ok((input, operator)) => {
                 self.input = input;
@@ -2113,7 +2189,7 @@ impl Iterator for ContentOperations<'_> {
 
 pub fn content_strict(input: ParserInput) -> Result<Content<Vec<Operation>>, error::ParseError> {
     let (rest, content) =
-        _content(input).map_err(|_| error::ParseError::InvalidContentStream)?;
+        _content(input, None).map_err(|_| error::ParseError::InvalidContentStream)?;
     if !rest.is_empty() {
         return Err(error::ParseError::InvalidContentStream);
     }
@@ -2241,7 +2317,7 @@ BT
 [(b) 20 (ut generally tak) 10 (e more space than \\311)] TJ
 T* (encoded streams.) Tj
 		";
-        let content = tstrip(_content(test_span(stream)));
+        let content = tstrip(_content(test_span(stream), None));
         assert!(content.is_some());
     }
 
@@ -2408,6 +2484,87 @@ EI
     }
 
     #[test]
+    fn inline_image_named_colorspace_resolved() {
+        // A colour space name only the resource dictionary knows: the built-in rules
+        // reject it, and the resolver's four components size the image data.
+        let input = b"q BI /W 1 /H 1 /CS /Cs1 /BPC 8 ID \x01\x02\x03\x04 EI Q";
+        let resolver = |colorspace: &Object| match colorspace {
+            Object::Name(name) if name.as_slice() == b"Cs1" => Some(4),
+            _ => None,
+        };
+        let out = content_with_inline_colorspaces(test_span(input), &resolver).unwrap();
+        let ops: Vec<&str> = out.operations.iter().map(|o| o.operator.as_ref()).collect();
+        assert_eq!(ops, vec!["q", "BI", "Q"]);
+        let image = out.operations[1].operands[0].as_stream().unwrap();
+        assert_eq!(image.content, b"\x01\x02\x03\x04");
+        assert_eq!(
+            image.dict.get(b"ColorSpace").unwrap().as_name().unwrap(),
+            b"Cs1"
+        );
+    }
+
+    #[test]
+    fn inline_image_unresolved_colorspace_still_skipped() {
+        // Without a resolver an unknown name keeps the old behaviour: the inline image
+        // is skipped and parsing resumes after EI.
+        let input = b"q BI /W 1 /H 1 /CS /Cs1 /BPC 8 ID \x01\x02\x03\x04 EI Q";
+        let out = content(test_span(input)).unwrap();
+        let ops: Vec<&str> = out.operations.iter().map(|o| o.operator.as_ref()).collect();
+        assert_eq!(ops, vec!["q", "BI", "Q"]);
+        assert!(out.operations[1].operands.is_empty());
+
+        // Returning None from the resolver keeps exactly the same behaviour.
+        let resolver = |_: &Object| None;
+        let out = content_with_inline_colorspaces(test_span(input), &resolver).unwrap();
+        let ops: Vec<&str> = out.operations.iter().map(|o| o.operator.as_ref()).collect();
+        assert_eq!(ops, vec!["q", "BI", "Q"]);
+        assert!(out.operations[1].operands.is_empty());
+    }
+
+    #[test]
+    fn inline_image_resolver_called_once_per_image_in_order() {
+        use std::cell::RefCell;
+        let input = b"BI /W 1 /H 1 /CS /First /BPC 8 ID \x00 EI \
+                      BI /W 1 /H 1 /CS /Second /BPC 8 ID \x00\x00\x00 EI";
+        let seen = RefCell::new(Vec::new());
+        let resolver = |colorspace: &Object| {
+            seen.borrow_mut().push(colorspace.clone());
+            match colorspace.as_name().ok()? {
+                b"First" => Some(1),
+                b"Second" => Some(3),
+                _ => None,
+            }
+        };
+        let ops = ContentOperations::with_resolver(test_span(input), &resolver)
+            .collect::<crate::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(ops.len(), 2);
+        assert_eq!(
+            seen.into_inner(),
+            vec![
+                Object::Name(crate::PdfName::new(b"First")),
+                Object::Name(crate::PdfName::new(b"Second"))
+            ]
+        );
+    }
+
+    #[test]
+    fn inline_image_mask_resolver_sees_null() {
+        use std::cell::RefCell;
+        // An image mask has no colour space of its own, so the resolver sees Null.
+        let input = b"BI /W 8 /H 1 /IM true /BPC 1 /CS /Ignored ID \xff EI";
+        let seen = RefCell::new(None);
+        let resolver = |colorspace: &Object| {
+            *seen.borrow_mut() = Some(colorspace.clone());
+            None
+        };
+        let out = content_with_inline_colorspaces(test_span(input), &resolver).unwrap();
+        assert_eq!(seen.into_inner(), Some(Object::Null));
+        let image = out.operations[0].operands[0].as_stream().unwrap();
+        assert_eq!(image.content, b"\xff");
+    }
+
+    #[test]
     fn inline_image_with_invalid_dimensions_skipped() {
         // Negative dimensions or a byte count that doesn't fit in usize must not overflow.
         for dims in [
@@ -2432,7 +2589,7 @@ EI
 ID
 00000z0z00zzz00z0zzz0zzzEI aazazaazzzaazazzzazzz
 EI";
-        let out = super::inline_image(test_span(input)).unwrap().1;
+        let out = super::inline_image(test_span(input), None).unwrap().1;
         assert_eq!(&out.1, "BI");
         assert_eq!(
             &out.0[0].as_stream().unwrap().content,
@@ -2481,7 +2638,7 @@ EI";
     fn inline_image_data_after_crlf() {
         // A CR LF after ID is one end-of-line, so the data starts after the LF.
         let input = b"BI /CS /DeviceGray /W 2 /H 1 /BPC 8 ID\r\n\n\x80\nEI";
-        let out = super::inline_image(test_span(input)).unwrap().1;
+        let out = super::inline_image(test_span(input), None).unwrap().1;
         assert_eq!(&out.0[0].as_stream().unwrap().content, b"\n\x80");
     }
 

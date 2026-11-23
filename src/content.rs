@@ -1,6 +1,6 @@
 use super::{Object, Stream};
 use crate::Result;
-pub use crate::parser::ContentOperations;
+pub use crate::parser::{ContentOperations, InlineColorspaceResolver};
 use crate::writer::Writer;
 use std::borrow::Cow;
 use std::io::Write;
