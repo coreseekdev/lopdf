@@ -60,7 +60,7 @@ mod test {
         let text_string = encodings::string_to_bytes(&encodings::PDF_DOC_ENCODING, input);
         // let text_string = input.bytes().collect::<Vec<_>>();
         let dict = Object::Dictionary(dictionary!(
-            "Key" => Object::String(text_string, StringFormat::Literal),
+            "Key" => Object::String(text_string.into(), StringFormat::Literal),
         ));
         let mut actual = vec![];
         Writer::write_object(&mut actual, &dict).unwrap();

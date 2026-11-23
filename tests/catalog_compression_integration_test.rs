@@ -52,7 +52,7 @@ fn test_catalog_included_in_object_stream_output() {
         .iter()
         .filter(|(_, obj)| {
             if let Object::Stream(s) = obj {
-                s.dict.get(b"Type").ok() == Some(&Object::Name(b"ObjStm".to_vec()))
+                s.dict.get(b"Type").ok() == Some(&Object::Name(b"ObjStm".to_vec().into()))
             } else {
                 false
             }

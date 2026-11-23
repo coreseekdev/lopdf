@@ -67,7 +67,7 @@ end"
             Operation::new(
                 "Tj",
                 vec![Object::String(
-                    literal_encoded_with_cmap.to_vec(),
+                    literal_encoded_with_cmap.to_vec().into(),
                     StringFormat::Hexadecimal,
                 )],
             ),

@@ -20,12 +20,12 @@ fn writes_scalars() {
 
 #[test]
 fn writes_names_and_strings() {
-    assert_eq!(write(&Object::Name(b"Type".to_vec())), b"/Type");
+    assert_eq!(write(&Object::Name(b"Type".to_vec().into())), b"/Type");
     // A space is escaped as #20.
-    assert_eq!(write(&Object::Name(b"Two Words".to_vec())), b"/Two#20Words");
-    assert_eq!(write(&Object::String(b"hi".to_vec(), StringFormat::Literal)), b"(hi)");
+    assert_eq!(write(&Object::Name(b"Two Words".to_vec().into())), b"/Two#20Words");
+    assert_eq!(write(&Object::String(b"hi".to_vec().into(), StringFormat::Literal)), b"(hi)");
     assert_eq!(
-        write(&Object::String(b"hi".to_vec(), StringFormat::Hexadecimal)),
+        write(&Object::String(b"hi".to_vec().into(), StringFormat::Hexadecimal)),
         b"<6869>"
     );
 }

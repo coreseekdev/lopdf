@@ -170,7 +170,7 @@ pub fn merge_documents(documents: Vec<(u32, Document)>) -> Option<Document> {
                 documents_pages.insert(key, value);
             });
 
-        documents_objects.extend(doc.objects);
+        documents_objects.extend(doc.objects.iter().map(|(id, obj)| (*id, obj.clone())));
 
         // Lets shadow our pointer back if nothing then set to (0,0) tto point to the next page
         let object = first_object.unwrap_or((0, 0));

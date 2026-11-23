@@ -9,7 +9,7 @@ fn main() {
     // Add some simple objects
     obj_stream.add_object((1, 0), Object::Integer(42)).unwrap();
     obj_stream
-        .add_object((2, 0), Object::String(b"Hello".to_vec(), lopdf::StringFormat::Literal))
+        .add_object((2, 0), Object::String(b"Hello".to_vec().into(), lopdf::StringFormat::Literal))
         .unwrap();
     obj_stream.add_object((3, 0), Object::Boolean(true)).unwrap();
 

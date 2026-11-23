@@ -34,7 +34,7 @@ fn sample_document() -> Document {
         "Pages" => Object::Reference(pages_id),
     });
     let info_id = doc.add_object(dictionary! {
-        "Title" => Object::String(b"lopdf 479".to_vec(), StringFormat::Literal),
+        "Title" => Object::String(b"lopdf 479".to_vec().into(), StringFormat::Literal),
     });
 
     doc.trailer.set("Root", Object::Reference(catalog_id));
@@ -43,8 +43,8 @@ fn sample_document() -> Document {
     doc.trailer.set(
         "ID",
         Object::Array(vec![
-            Object::String(id.clone(), StringFormat::Literal),
-            Object::String(id, StringFormat::Literal),
+            Object::String(id.clone().into(), StringFormat::Literal),
+            Object::String(id.into(), StringFormat::Literal),
         ]),
     );
 

@@ -1361,12 +1361,12 @@ mod tests {
             "V" => Object::Integer(5),
             "R" => Object::Integer(6),
             "Length" => Object::Integer(256),
-            "O" => Object::String(o_127, StringFormat::Literal),
-            "OE" => Object::String(vec![0xCCu8; 32], StringFormat::Literal),
-            "U" => Object::String(u_127, StringFormat::Literal),
-            "UE" => Object::String(vec![0xDDu8; 32], StringFormat::Literal),
+            "O" => Object::String(o_127.into(), StringFormat::Literal),
+            "OE" => Object::String(vec![0xCCu8; 32].into(), StringFormat::Literal),
+            "U" => Object::String(u_127.into(), StringFormat::Literal),
+            "UE" => Object::String(vec![0xDDu8; 32].into(), StringFormat::Literal),
             "P" => Object::Integer(-3388),
-            "Perms" => Object::String(vec![0xEEu8; 16], StringFormat::Literal)
+            "Perms" => Object::String(vec![0xEEu8; 16].into(), StringFormat::Literal)
         };
 
         let encrypt_id = doc.add_object(encrypt_dict);
@@ -1395,12 +1395,12 @@ mod tests {
             "V" => Object::Integer(5),
             "R" => Object::Integer(6),
             "Length" => Object::Integer(256),
-            "O" => Object::String(vec![0xAAu8; 47], StringFormat::Literal),
-            "OE" => Object::String(vec![0xCCu8; 32], StringFormat::Literal),
-            "U" => Object::String(vec![0xBBu8; 48], StringFormat::Literal),
-            "UE" => Object::String(vec![0xDDu8; 32], StringFormat::Literal),
+            "O" => Object::String(vec![0xAAu8; 47].into(), StringFormat::Literal),
+            "OE" => Object::String(vec![0xCCu8; 32].into(), StringFormat::Literal),
+            "U" => Object::String(vec![0xBBu8; 48].into(), StringFormat::Literal),
+            "UE" => Object::String(vec![0xDDu8; 32].into(), StringFormat::Literal),
             "P" => Object::Integer(-3388),
-            "Perms" => Object::String(vec![0xEEu8; 16], StringFormat::Literal)
+            "Perms" => Object::String(vec![0xEEu8; 16].into(), StringFormat::Literal)
         };
 
         let encrypt_id = doc.add_object(encrypt_dict);

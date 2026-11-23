@@ -130,7 +130,7 @@ fn build_doc_with_tounicode(tounicode: &str, encoded_text: Vec<u8>) -> Document 
             Operation::new("BT", vec![]),
             Operation::new("Tf", vec!["F1".into(), 12.into()]),
             Operation::new("Td", vec![50.into(), 700.into()]),
-            Operation::new("Tj", vec![Object::String(encoded_text, StringFormat::Hexadecimal)]),
+            Operation::new("Tj", vec![Object::String(encoded_text.into(), StringFormat::Hexadecimal)]),
             Operation::new("ET", vec![]),
         ],
     };

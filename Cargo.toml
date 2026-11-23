@@ -47,6 +47,17 @@ weezl = "0.2"
 zlib-rs = { version = "0.6", default-features = false, features = ["std"] }
 skrifa = { version = "0.45.1", optional = true }
 
+[dev-dependencies]
+clap = { version = "4.6", features = ["derive"] }
+env_logger = "0.11"
+flate2 = "1.1"
+serde_json = "1.0"
+shellexpand = "3.1"
+tempfile = "3.27"
+
+[target.'cfg(not(target_family="wasm"))'.dev-dependencies]
+criterion = "0.8"
+
 [features]
 async = ["tokio/rt-multi-thread", "tokio/macros"]
 chrono = ["dep:chrono"]
@@ -58,3 +69,22 @@ jiff = ["dep:jiff"]
 wasm_js = ["getrandom/wasm_js"]
 serde = ["dep:serde"]
 time = ["dep:time"]
+
+[[example]]
+name = "extract_toc"
+required-features = ["serde"]
+
+[[example]]
+name = "extract_text"
+required-features = ["serde"]
+
+[[example]]
+name = "rotate"
+
+[[bench]]
+name = "datetime"
+harness = false
+
+[[bench]]
+name = "parse"
+harness = false

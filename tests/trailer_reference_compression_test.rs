@@ -74,8 +74,8 @@ fn non_reference_trailer_entries_do_not_block_compression() {
     doc.trailer.set(
         "ID",
         Object::Array(vec![
-            Object::String(vec![1, 2, 3, 4], StringFormat::Hexadecimal),
-            Object::String(vec![5, 6, 7, 8], StringFormat::Hexadecimal),
+            Object::String(vec![1, 2, 3, 4].into(), StringFormat::Hexadecimal),
+            Object::String(vec![5, 6, 7, 8].into(), StringFormat::Hexadecimal),
         ]),
     );
     doc.trailer.set("Encrypt", Object::Null);

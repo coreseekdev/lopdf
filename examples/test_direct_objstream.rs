@@ -29,7 +29,7 @@ fn main() {
     // Add some objects
     obj_stream.add_object((1, 0), Object::Integer(42)).unwrap();
     obj_stream
-        .add_object((2, 0), Object::String(b"Test".to_vec(), lopdf::StringFormat::Literal))
+        .add_object((2, 0), Object::String(b"Test".to_vec().into(), lopdf::StringFormat::Literal))
         .unwrap();
 
     println!("Object stream has {} objects", obj_stream.object_count());

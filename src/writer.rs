@@ -826,13 +826,13 @@ fn save_document() {
     doc.objects.insert((4, 0), Real(0.5));
     doc.objects.insert(
         (5, 0),
-        String("text((\r)".as_bytes().to_vec(), StringFormat::Literal),
+        String("text((\r)".as_bytes().to_vec().into(), StringFormat::Literal),
     );
     doc.objects.insert(
         (6, 0),
-        String("text((\r)".as_bytes().to_vec(), StringFormat::Hexadecimal),
+        String("text((\r)".as_bytes().to_vec().into(), StringFormat::Hexadecimal),
     );
-    doc.objects.insert((7, 0), Name(b"name \t".to_vec()));
+    doc.objects.insert((7, 0), Name(b"name \t".to_vec().into()));
     doc.objects.insert((8, 0), Reference((1, 0)));
     doc.objects
         .insert((9, 2), Array(vec![Integer(1), Integer(2), Integer(3)]));
@@ -843,7 +843,7 @@ fn save_document() {
     let mut dict = Dictionary::new();
     dict.set("A", Null);
     dict.set("B", false);
-    dict.set("C", Name(b"name".to_vec()));
+    dict.set("C", Name(b"name".to_vec().into()));
     doc.objects.insert((12, 0), Object::Dictionary(dict));
     doc.max_id = 12;
 

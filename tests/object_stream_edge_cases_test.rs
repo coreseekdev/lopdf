@@ -23,9 +23,9 @@ fn trailer_contents_never_block_compression() {
                 (b"Real".to_vec(), Object::Real(1.25)),
                 (
                     b"String".to_vec(),
-                    Object::String(b"test".to_vec(), lopdf::StringFormat::Literal),
+                    Object::String(b"test".to_vec().into(), lopdf::StringFormat::Literal),
                 ),
-                (b"Name".to_vec(), Object::Name(b"Test".to_vec())),
+                (b"Name".to_vec(), Object::Name(b"Test".to_vec().into())),
                 (b"Array".to_vec(), Object::Array(vec![Object::Integer(1)])),
                 (b"Dict".to_vec(), Object::Dictionary(dictionary! { "Key" => "Value" })),
             ],
@@ -35,7 +35,7 @@ fn trailer_contents_never_block_compression() {
             vec![
                 (
                     "Ünïcödé".as_bytes().to_vec(),
-                    Object::String(b"test".to_vec(), lopdf::StringFormat::Literal),
+                    Object::String(b"test".to_vec().into(), lopdf::StringFormat::Literal),
                 ),
                 ("日本語".as_bytes().to_vec(), Object::Integer(42)),
                 ("🎯".as_bytes().to_vec(), Object::Boolean(true)),

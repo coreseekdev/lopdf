@@ -42,8 +42,8 @@ fn main() {
     doc.trailer.set(
         "ID",
         lopdf::Object::Array(vec![
-            lopdf::Object::String(vec![1u8; 16], lopdf::StringFormat::Literal),
-            lopdf::Object::String(vec![2u8; 16], lopdf::StringFormat::Literal),
+            lopdf::Object::String(vec![1u8; 16].into(), lopdf::StringFormat::Literal),
+            lopdf::Object::String(vec![2u8; 16].into(), lopdf::StringFormat::Literal),
         ]),
     );
 
@@ -163,8 +163,8 @@ async fn main() {
     doc.trailer.set(
         "ID",
         lopdf::Object::Array(vec![
-            lopdf::Object::String(vec![1u8; 16], lopdf::StringFormat::Literal),
-            lopdf::Object::String(vec![2u8; 16], lopdf::StringFormat::Literal),
+            lopdf::Object::String(vec![1u8; 16].into(), lopdf::StringFormat::Literal),
+            lopdf::Object::String(vec![2u8; 16].into(), lopdf::StringFormat::Literal),
         ]),
     );
 

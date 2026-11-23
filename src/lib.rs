@@ -55,6 +55,7 @@ pub use object_stream::{ObjectStream, ObjectStreamBuilder, ObjectStreamConfig};
 pub use outlines::Outline;
 pub use reader::{PdfMetadata, RangeSource, Reader};
 pub use save_options::{SaveOptions, SaveOptionsBuilder};
+pub use writer::Writer;
 pub use toc::{Toc, TocType};
 
 pub use parser_aux::substr;

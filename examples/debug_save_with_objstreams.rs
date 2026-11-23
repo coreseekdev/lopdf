@@ -9,7 +9,7 @@ fn main() {
 
     // Add some simple objects that can be compressed
     let obj1_id = doc.add_object(Object::Integer(42));
-    let obj2_id = doc.add_object(Object::String(b"Hello".to_vec(), lopdf::StringFormat::Literal));
+    let obj2_id = doc.add_object(Object::String(b"Hello".to_vec().into(), lopdf::StringFormat::Literal));
     let obj3_id = doc.add_object(dictionary! {
         "Type" => "TestObject",
         "Value" => 123
