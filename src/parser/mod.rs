@@ -1122,7 +1122,7 @@ fn xref(input: ParserInput, strict: bool) -> NomResult<Xref> {
     if rest.starts_with(b" ") {
         rest = &rest[1..];
     }
-    rest = xref_eol(rest, strict)?;
+    rest = xref_line_eol(rest)?;
     let mut xref = Xref::new(0, XrefType::CrossReferenceTable);
     loop {
         rest = space(rest)?.0;
@@ -1137,7 +1137,7 @@ fn xref(input: ParserInput, strict: bool) -> NomResult<Xref> {
             )));
         };
         let (next, count) = unsigned_int::<u32>(next)?;
-        let next = xref_eol(next.strip_prefix(b" ").unwrap_or(next), strict)?;
+        let next = xref_line_eol(next.strip_prefix(b" ").unwrap_or(next))?;
         rest = next;
         for index in 0..count as usize {
             let entry = match xref_entry(rest, strict) {
@@ -1166,6 +1166,28 @@ fn xref(input: ParserInput, strict: bool) -> NomResult<Xref> {
             }
         }
     }
+}
+
+/// End-of-line after the `xref` keyword and its subsection headers.  Unlike
+/// an entry, which ISO 32000-1 7.5.4 fixes at 20 bytes (EOL `SP CR`, `SP LF`
+/// or `CR LF`), those lines end with any EOL marker; a bare LF is conforming
+/// and is what the writer emits.
+fn xref_line_eol(input: ParserInput) -> Result<ParserInput, ParseErr<NomError<'_>>> {
+    for marker in [
+        &b"\r\n"[..],
+        &b" \r"[..],
+        &b" \n"[..],
+        &b"\n"[..],
+        &b"\r"[..],
+    ] {
+        if let Some(rest) = input.strip_prefix(marker) {
+            return Ok(rest);
+        }
+    }
+    Err(ParseErr::Error(NomError::from_error_kind(
+        input,
+        ErrorKind::Tag,
+    )))
 }
 
 fn xref_eol(input: ParserInput, strict: bool) -> Result<ParserInput, ParseErr<NomError<'_>>> {

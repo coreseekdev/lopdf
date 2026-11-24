@@ -2821,18 +2821,42 @@ impl<'a> Reader<'a> {
             return None;
         }
 
-        let mut xref = Xref::new(markers.len() as u32, XrefType::CrossReferenceTable);
+        let stream_markers = Self::recovered_stream_markers(&self.buffer, &markers);
+        let mut xref = Xref::new(0, XrefType::CrossReferenceTable);
+        // Dictionaries that act as trailers, in file order: the newest usable
+        // one wins, the older ones fill keys it lacks (pdfium RebuildCrossRef
+        // merges every recovered trailer, cpdf_parser.cpp:820-847).
+        let mut candidates: Vec<(usize, Dictionary)> = Vec::new();
         for (offset, (number, generation)) in markers {
             // Incremental updates append, so later revisions win.
             xref.insert(number, XrefEntry::Normal { offset, generation });
+            if stream_markers.contains(&offset)
+                && let Some(dict) = self.absorb_recovered_stream(&mut xref, number, offset)
+            {
+                candidates.push((offset as usize, dict));
+            }
+        }
+        candidates.extend(self.recovered_trailers());
+        // Newest first: the trailer of the last revision describes the file.
+        candidates.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+
+        let chosen = candidates
+            .iter()
+            .position(|(_, dict)| self.usable_recovered_root(&xref, dict))?;
+        let (chosen_pos, mut trailer) = candidates[chosen].clone();
+        // A newer trailer may omit /Root, /Info, /Encrypt or /ID that an older
+        // section still carries; the nearest older one supplies each key.
+        for (_, dict) in candidates.iter().filter(|(pos, _)| *pos < chosen_pos) {
+            for (key, value) in dict {
+                if trailer.get(key).is_err() {
+                    trailer.set(key.clone(), value.clone());
+                }
+            }
         }
         // Normalize like `resolve_xref_and_trailer`: size spans object numbers
         // up to the highest, not physical copies across incremental updates.
+        // Object-stream members discovered above raise it past the markers.
         xref.size = xref.max_id().saturating_add(1);
-
-        let (_trailer_pos, mut trailer) = self
-            .find_latest_trailer(&xref)
-            .or_else(|| self.find_latest_xref_stream_trailer(&xref))?;
         // As in resolution, drop the links to other cross-reference sections: the rebuilt
         // table replaces them, and their offsets would go out unchanged on the next save.
         trailer.remove(b"Prev");
@@ -2845,6 +2869,79 @@ impl<'a> Reader<'a> {
             xref.entries.len()
         );
         Some((xref, trailer))
+    }
+
+    /// Offsets of markers whose object may be an object stream or a
+    /// cross-reference stream.  Those are the only objects reconstruction has
+    /// to parse: an object stream contributes its compressed members, and a
+    /// cross-reference stream's dictionary is a trailer.  The byte search keeps
+    /// the eager parse away from every ordinary object in a damaged file.
+    fn recovered_stream_markers(buffer: &[u8], markers: &[(u32, ObjectId)]) -> HashSet<u32> {
+        let offsets: Vec<u32> = markers.iter().map(|(offset, _)| *offset).collect();
+        let mut found = HashSet::new();
+        for pattern in [&b"/ObjStm"[..], &b"/XRef"[..]] {
+            for hit in memchr::memmem::find_iter(buffer, pattern) {
+                let Ok(hit) = u32::try_from(hit) else {
+                    break;
+                };
+                // The owning object is the nearest marker at or before the
+                // hit; a hit inside a real payload still resolves to that
+                // stream's own object, and the parsed type decides.
+                let index = match offsets.binary_search(&hit) {
+                    Ok(index) => index,
+                    Err(0) => continue,
+                    Err(index) => index - 1,
+                };
+                found.insert(offsets[index]);
+            }
+        }
+        found
+    }
+
+    /// Parse one recovered stream object.  An object stream's members become
+    /// compressed entries (pdfium RebuildCrossRef calls AddCompressed,
+    /// cpdf_parser.cpp:839-847); a cross-reference stream's dictionary is
+    /// returned so the caller can treat it as a trailer.
+    fn absorb_recovered_stream(
+        &self,
+        xref: &mut Xref,
+        container: u32,
+        offset: u32,
+    ) -> Option<Dictionary> {
+        let (_, object) = self.parse_raw_object(self.buffer.get(offset as usize..)?).ok()?;
+        let Object::Stream(stream) = object else {
+            return None;
+        };
+        if stream.dict.has_type(b"XRef") {
+            return Some(stream.dict);
+        }
+        if !stream.dict.has_type(b"ObjStm") {
+            return None;
+        }
+        let Ok(object_stream) =
+            ObjectStream::new_with_limit(&stream, self.max_decompressed_size)
+        else {
+            return None;
+        };
+        for (index, member) in object_stream.into_members().into_iter().enumerate() {
+            let Some((id, _)) = member else {
+                continue;
+            };
+            if id.0 > MAX_RECONSTRUCTED_OBJECTS as u32 {
+                continue;
+            }
+            let Ok(index) = u16::try_from(index) else {
+                break;
+            };
+            xref.insert(
+                id.0,
+                XrefEntry::Compressed {
+                    container,
+                    index,
+                },
+            );
+        }
+        None
     }
 
     /// Collect `(offset, id)` of every indirect-object header in one pass.
@@ -2915,28 +3012,33 @@ impl<'a> Reader<'a> {
             {
                 let after_keyword = pos + STREAM_KEYWORD.len();
                 let dictionary = std::mem::replace(&mut dictionary_start, after_keyword);
-                let endstream = if unterminated {
-                    None
-                } else {
-                    find_from(buffer, after_keyword, END_STREAM_KEYWORD)
+                // An orphaned keyword (its own object header is absent) does
+                // not start a payload: skipping to a later `endobj` would hide
+                // the objects in between.  pdfium's rebuild only skips a
+                // payload while parsing an object it has located.
+                let owner = Self::stream_owner(buffer, dictionary, pos);
+                let endstream = match owner {
+                    Some(_) if !unterminated => {
+                        find_from(buffer, after_keyword, END_STREAM_KEYWORD)
+                    }
+                    _ => None,
                 };
-                unterminated = endstream.is_none();
-                // Damaged stream without terminator: fall back to the /Length hint so the
-                // payload cannot hide pseudo headers, while later objects stay reachable.
+                if owner.is_some() && !unterminated {
+                    unterminated = endstream.is_none();
+                }
+                // Damaged stream without terminator: fall back to the /Length
+                // hint so the payload cannot hide pseudo headers, then to the
+                // object's `endobj`, as pdfium's indirect-object reader does.
+                // A stream with no terminator at all falls through to byte
+                // scanning.
                 let payload_end = endstream
                     .map(|end| end + END_STREAM_KEYWORD.len())
-                    .or_else(|| Self::payload_end_by_length(buffer, dictionary, pos));
+                    .or_else(|| {
+                        let owner = owner?;
+                        Self::payload_end_by_length(buffer, owner, pos)
+                            .or_else(|| find_from(buffer, after_keyword, b"endobj").map(|p| p + 6))
+                    });
                 if let Some(end) = payload_end {
-                    pos = end;
-                    dictionary_start = end;
-                    continue;
-                }
-                // Unusable /Length too. Binary payloads contain arbitrary
-                // bytes (including `(` and convincing headers), so resume
-                // after the object's `endobj`, as pdfium's indirect-object
-                // reader does; only a stream with no terminator at all falls
-                // through to byte scanning.
-                if let Some(end) = find_from(buffer, after_keyword, b"endobj").map(|p| p + 6) {
                     pos = end;
                     dictionary_start = end;
                     continue;
@@ -2973,32 +3075,57 @@ impl<'a> Reader<'a> {
         markers
     }
 
+    /// Start of the object header that owns the `stream` keyword at
+    /// `stream_pos`, when its dictionary lies after `dictionary_start`
+    /// (where the previous keyword or its payload ended).  A keyword without
+    /// a header of its own is orphaned: it belongs to no object whose payload
+    /// can be bounded.
+    fn stream_owner(buffer: &[u8], dictionary_start: usize, stream_pos: usize) -> Option<usize> {
+        let head = buffer.get(dictionary_start..stream_pos)?;
+        let obj_pos = dictionary_start
+            + head.windows(3).rposition(|window| window == b"obj")?;
+        Self::object_header_before(buffer, obj_pos)
+    }
+
+    /// Start of the `N G obj` header whose `obj` keyword ends at `obj_pos`.
+    /// Stepping back over the two numbers (and their blanks) rejects an `obj`
+    /// that is part of another token, such as the tail of `endobj`.
+    fn object_header_before(buffer: &[u8], obj_pos: usize) -> Option<usize> {
+        fn digits_back(buffer: &[u8], mut pos: usize) -> Option<usize> {
+            let end = pos;
+            while pos > 0 && buffer[pos - 1].is_ascii_digit() {
+                pos -= 1;
+            }
+            (pos < end).then_some(pos)
+        }
+        let mut pos = obj_pos;
+        while pos > 0 && matches!(buffer[pos - 1], b' ' | b'\t' | b'\r' | b'\n') {
+            pos -= 1;
+        }
+        pos = digits_back(buffer, pos)?;
+        while pos > 0 && matches!(buffer[pos - 1], b' ' | b'\t' | b'\r' | b'\n') {
+            pos -= 1;
+        }
+        pos = digits_back(buffer, pos)?;
+        Self::parse_object_header(&buffer[pos..]).map(|_| pos)
+    }
+
     /// Resume offset past a stream payload according to a *direct* `/Length`
-    /// integer in the dictionary preceding the `stream` keyword at
-    /// `stream_pos`. The search is scoped to the current object (after the
-    /// nearest preceding `obj` keyword) so a missing `/Length` cannot latch
-    /// onto a previous object's value. Nor does it reach back before
-    /// `dictionary_start`, where the previous keyword or its payload ended:
-    /// that dictionary belongs to another stream, and stopping there keeps
-    /// the searches of all keywords to one pass over the buffer. Returns
-    /// `None` when the hint is absent, indirect, or points outside the
-    /// buffer — damaged files tend to carry wrong `/Length` values, so it
-    /// must stay a hint, never a hard boundary.
+    /// integer in the dictionary of the object whose header starts at
+    /// `header_start`.  Scoping to that object keeps a missing `/Length`
+    /// from latching onto a previous object's value or another keyword's
+    /// dictionary. Returns `None` when the hint is absent, indirect, or
+    /// points outside the buffer — damaged files tend to carry wrong
+    /// `/Length` values, so it must stay a hint, never a hard boundary.
     fn payload_end_by_length(
         buffer: &[u8],
-        dictionary_start: usize,
+        header_start: usize,
         stream_pos: usize,
     ) -> Option<usize> {
         const LENGTH_KEY: &[u8] = b"/Length";
-        const OBJ_KEYWORD: &[u8] = b"obj";
         const STREAM_KEYWORD_LEN: usize = b"stream".len();
 
-        let head = buffer.get(dictionary_start..stream_pos)?;
-        let obj_pos = dictionary_start
-            + head
-                .windows(OBJ_KEYWORD.len())
-                .rposition(|window| window == OBJ_KEYWORD)?;
-        let dict_region = &buffer[obj_pos + OBJ_KEYWORD.len()..stream_pos];
+        let dict_region = buffer.get(header_start..stream_pos)?;
         // Nearest `/Length` in this object's dictionary; parsing it validates
         // that the match really is a key with an integer value.
         let key_pos = dict_region
@@ -3069,45 +3196,14 @@ impl<'a> Reader<'a> {
         Some((number, generation))
     }
 
-    /// Newest cross-reference stream whose dictionary carries a usable
-    /// `/Root`.  A file with xref streams only has no `trailer` keyword, so
-    /// recovery must read the stream dictionary itself (pdfium
-    /// cpdf_parser.cpp cross-reference stream trailer path).
-    fn find_latest_xref_stream_trailer(&self, xref: &Xref) -> Option<(usize, Dictionary)> {
-        let mut candidates: Vec<usize> = xref
-            .entries
-            .values()
-            .filter_map(|entry| match entry {
-                XrefEntry::Normal { offset, .. } => Some(*offset as usize),
-                _ => None,
-            })
-            .collect();
-        candidates.sort_unstable();
-        for offset in candidates.into_iter().rev() {
-            if offset >= self.buffer.len() {
-                continue;
-            }
-            let Ok((_, object)) = self.parse_raw_object(&self.buffer[offset..]) else {
-                continue;
-            };
-            let Ok(stream) = object.as_stream() else {
-                continue;
-            };
-            if !stream.dict.has_type(b"XRef") {
-                continue;
-            }
-            if self.usable_recovered_root(xref, &stream.dict) {
-                return Some((offset, stream.dict.clone()));
-            }
-        }
-        None
-    }
-
-    /// Newest backwards-scanned `trailer` whose `/Root` references a scanned
-    /// catalog with a page tree, ignoring trailer lookalikes inside stream
-    /// payloads (pdfium `RebuildCrossRef`, cpdf_parser.cpp:809-859).
-    fn find_latest_trailer(&self, xref: &Xref) -> Option<(usize, Dictionary)> {
+    /// `trailer` dictionaries in the buffer, newest first.  A file with
+    /// cross-reference streams only has no `trailer` keyword; those come from
+    /// the streams themselves (see `reconstruct_xref_and_trailer`).  Trailer
+    /// lookalikes inside stream payloads are ignored (pdfium `RebuildCrossRef`,
+    /// cpdf_parser.cpp:809-859).
+    fn recovered_trailers(&self) -> Vec<(usize, Dictionary)> {
         let payloads = Self::stream_payload_ranges(&self.buffer);
+        let mut trailers = Vec::new();
         let mut bound = self.buffer.len();
         for _ in 0..MAX_TRAILER_CANDIDATES {
             let Some(pos) = Reader::search_substring(&self.buffer[..bound], b"trailer", 0) else {
@@ -3132,17 +3228,18 @@ impl<'a> Reader<'a> {
             let Ok((_, dict)) = parser::dictionary(&after_keyword[dict_start..]) else {
                 continue;
             };
-            if self.usable_recovered_root(xref, &dict) {
-                return Some((pos, dict));
-            }
+            trailers.push((pos, dict));
         }
-        None
+        trailers
     }
 
     /// The byte ranges occupied by stream payloads.  A `stream` keyword only
-    /// counts when it ends a line and is not the tail of `endstream`; the
-    /// payload then runs to the next `endstream` (or the end of the buffer
-    /// when the producer omitted it).
+    /// counts when it ends a line, is not the tail of `endstream`, and has an
+    /// object header of its own; an orphaned keyword hides nothing, so the
+    /// bytes after it stay visible to the trailer search.  The payload runs to
+    /// the next `endstream`, else to the object's `/Length` or `endobj`; when
+    /// none of those bound it, no range is recorded and the bytes are scanned
+    /// normally.
     fn stream_payload_ranges(buffer: &[u8]) -> Vec<(usize, usize)> {
         const STREAM_KEYWORD: &[u8] = b"stream";
         const END_STREAM_KEYWORD: &[u8] = b"endstream";
@@ -3152,6 +3249,9 @@ impl<'a> Reader<'a> {
         let mut in_comment = false;
         // Where the dictionary before the next `stream` keyword can start.
         let mut dictionary_start = 0;
+        // No `endstream` follows a later keyword either once one keyword has
+        // none, so searching again would rescan the rest of the buffer.
+        let mut unterminated = false;
         while pos < buffer.len() {
             if in_comment {
                 in_comment = !matches!(buffer[pos], b'\r' | b'\n');
@@ -3177,25 +3277,58 @@ impl<'a> Reader<'a> {
                 };
                 let payload_start = keyword_end + eol_len;
                 let dictionary = std::mem::replace(&mut dictionary_start, keyword_end);
-                let endstream = find_from(buffer, keyword_end, END_STREAM_KEYWORD)
-                    .map(|end| end + END_STREAM_KEYWORD.len());
-                // An unterminated stream without /Length ends at its
-                // `endobj`, as in the object scanner. Treating the rest of
-                // the file as payload would hide the real trailer from
-                // recovery (pdfium's indirect-object reader stops at
-                // `endobj`).
+                let owner = Self::stream_owner(buffer, dictionary, pos);
+                let endstream = match owner {
+                    Some(_) if !unterminated => find_from(buffer, keyword_end, END_STREAM_KEYWORD),
+                    _ => None,
+                };
+                if owner.is_some() && !unterminated {
+                    unterminated = endstream.is_none();
+                }
                 let payload_end = endstream
-                    .or_else(|| Self::payload_end_by_length(buffer, dictionary, pos))
-                    .or_else(|| find_from(buffer, keyword_end, b"endobj").map(|p| p + 6))
-                    .unwrap_or(buffer.len());
-                ranges.push((payload_start, payload_end));
-                pos = payload_end;
-                dictionary_start = payload_end;
+                    .map(|end| end + END_STREAM_KEYWORD.len())
+                    .or_else(|| {
+                        let owner = owner?;
+                        Self::payload_end_by_length(buffer, owner, pos)
+                            .or_else(|| find_from(buffer, keyword_end, b"endobj").map(|p| p + 6))
+                    });
+                if let Some(end) = payload_end {
+                    ranges.push((payload_start, end));
+                    pos = end;
+                    dictionary_start = end;
+                } else {
+                    pos += 1;
+                }
             } else {
                 pos += 1;
             }
         }
         ranges
+    }
+
+    /// The object a recovered entry selects: a direct body at its marker
+    /// offset, or a member of an object stream for a compressed entry.
+    fn recovered_object(&self, xref: &Xref, number: u32) -> Option<Object> {
+        match xref.get(number)? {
+            XrefEntry::Normal { offset, .. } => self
+                .parse_raw_object(self.buffer.get(*offset as usize..)?)
+                .ok()
+                .map(|(_, object)| object),
+            XrefEntry::Compressed { container, index } => {
+                let Some(XrefEntry::Normal { offset, .. }) = xref.get(*container) else {
+                    return None;
+                };
+                let (_, object) = self
+                    .parse_raw_object(self.buffer.get(*offset as usize..)?)
+                    .ok()?;
+                let stream = object.as_stream().ok()?;
+                let members =
+                    ObjectStream::new_with_limit(stream, self.max_decompressed_size).ok()?;
+                let (id, member) = members.member_at(usize::from(*index))?;
+                (id.0 == number).then(|| member.clone())
+            }
+            XrefEntry::Free { .. } | XrefEntry::UnusableFree => None,
+        }
     }
 
     /// Whether a recovered trailer's `/Root` is a catalog dictionary whose
@@ -3206,10 +3339,7 @@ impl<'a> Reader<'a> {
         let Ok(root) = trailer.get(b"Root").and_then(Object::as_reference) else {
             return false;
         };
-        let Some(XrefEntry::Normal { offset, .. }) = xref.get(root.0) else {
-            return false;
-        };
-        let Ok((_, object)) = self.parse_raw_object(&self.buffer[*offset as usize..]) else {
+        let Some(object) = self.recovered_object(xref, root.0) else {
             return false;
         };
         let Ok(catalog) = object.as_dict() else {
