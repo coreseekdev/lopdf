@@ -49,7 +49,6 @@ fn get_page_content_terminates_trailing_comment() {
 }
 
 #[test]
-#[ignore = "vendored Content encode/array helpers differ from upstream"]
 fn encode_writes_inline_images_back_in_line() {
     let data = b"q BI /W 2 /H 1 /CS /G /BPC 8 ID \x00\xff\nEI Q";
     let content = Content::decode(data).unwrap();
@@ -84,7 +83,6 @@ fn encode_writes_constructed_inline_image() {
 }
 
 #[test]
-#[ignore = "vendored Content encode/array helpers differ from upstream"]
 fn add_page_contents_appends_to_referenced_array() {
     let mut doc = Document::with_version("1.5");
     let s1 = doc.add_object(Stream::new(dictionary! {}, b"1 0 0 1 50 100 cm".to_vec()));
@@ -110,7 +108,6 @@ fn add_page_contents_appends_to_referenced_array() {
 }
 
 #[test]
-#[ignore = "vendored Content encode/array helpers differ from upstream"]
 fn change_page_content_replaces_referenced_array() {
     let mut doc = Document::with_version("1.5");
     let s1 = doc.add_object(Stream::new(dictionary! {}, b"1 0 0 1 50 100 cm".to_vec()));

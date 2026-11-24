@@ -809,8 +809,16 @@ impl EncryptionState {
             }
 
             encrypted.set(b"CF", Object::Dictionary(filters));
-            encrypted.set(b"StmF", Object::Name(self.stream_filter.clone().into()));
-            encrypted.set(b"StrF", Object::Name(self.string_filter.clone().into()));
+            // /StmF and /StrF are optional and default to /Identity (ISO 32000-1,
+            // Table 20).  The empty name does not mean the legacy RC4 cipher here;
+            // it means "use the default", so omit the entry rather than writing a
+            // malformed bare slash.
+            if !self.stream_filter.is_empty() {
+                encrypted.set(b"StmF", Object::Name(self.stream_filter.clone().into()));
+            }
+            if !self.string_filter.is_empty() {
+                encrypted.set(b"StrF", Object::Name(self.string_filter.clone().into()));
+            }
         }
 
         if self.revision >= 5 {
@@ -847,9 +855,15 @@ impl EncryptionState {
     }
 
     fn filter_for_name(&self, name: &[u8]) -> Arc<dyn CryptFilter> {
-        // V1/V2 carry no /StmF; the default is the legacy RC4 cipher.
+        // An absent /StmF or /StrF means different things per version: V1/V2 have
+        // no crypt filter dictionary at all and use the legacy RC4 cipher, while
+        // V4/V5 default to Identity (ISO 32000-1, Table 20).
         if name.is_empty() {
-            return Arc::new(Rc4CryptFilter);
+            return if self.version >= 4 {
+                Arc::new(IdentityCryptFilter)
+            } else {
+                Arc::new(Rc4CryptFilter)
+            };
         }
         // Identity is built in even when /CF does not declare it, and an
         // unknown name resolves to Identity in pdf.js (crypto.js:1305-1316).

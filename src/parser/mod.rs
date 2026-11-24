@@ -359,7 +359,12 @@ fn literal_body(
                 if depth == 0 {
                     return Err(index);
                 }
+                // Balanced parentheses are part of the string's bytes; the
+                // backslash is only needed to escape an unbalanced one
+                // (ISO 32000-1, 7.3.4.2).
+                out.push(b'(');
                 let consumed = literal_body(&input[index + 1..], depth - 1, out)?;
+                out.push(b')');
                 index += 1 + consumed;
             }
             b'\\' => {
@@ -1710,9 +1715,24 @@ fn operation_into<'a>(
     out: &mut Vec<Object>,
     resolver: Option<InlineColorspaceResolver<'_>>,
 ) -> NomResult<'a, Cow<'static, str>> {
-    match token_operation(input, out) {
+    // White space and comments separate operations, and a comment may itself
+    // follow white space (ISO 32000-1, 7.2.2), so skip both before either
+    // parser looks for an operator or operand.
+    let mut rest = input;
+    loop {
+        rest = skip_content_space(rest);
+        if rest.first() != Some(&b'%') {
+            break;
+        }
+        match comment(rest) {
+            Ok((next, ())) => rest = next,
+            Err(ParseErr::Error(_)) => break,
+            Err(error) => return Err(error),
+        }
+    }
+    match token_operation(rest, out) {
         Some(result) => result,
-        None => operation_into_nom(input, out, resolver),
+        None => operation_into_nom(rest, out, resolver),
     }
 }
 
@@ -1935,9 +1955,13 @@ fn image_data_stream(
         .and_then(|row_bits| row_bits.div_ceil(8).checked_mul(height))
         .ok_or_else(invalid_size)?;
 
-    // Build a full-key dictionary: the content interpreter and the stream
-    // decoders use the long PDF names, while inline images abbreviate them.
-    let mut full = Dictionary::new();
+    // Keep the dictionary as the producer wrote it (abbreviated keys and all),
+    // then add the long-name aliases the content interpreter and stream
+    // decoders use.  Both spellings describe the same entry: a decoder can
+    // read either, and `Content::encode` writes each entry once in the order
+    // it was read (see `inline_image_logical_key`).
+    let filter = get_abbr(b"F", b"Filter").ok().map(expand_inline_filter);
+    let mut full = stream_dict.clone();
     full.set("Width", Object::Integer(width as i64));
     full.set("Height", Object::Integer(height as i64));
     full.set(
@@ -1945,11 +1969,11 @@ fn image_data_stream(
         Object::Integer(if image_mask { 1 } else { bpc as i64 }),
     );
     if image_mask {
+        // An image mask has no colour space of its own (ISO 32000-1, 8.9.7).
         full.set("ImageMask", Object::Boolean(true));
     } else if let Some(colorspace) = &colorspace {
         full.set("ColorSpace", expand_inline_colorspace(colorspace));
     }
-    let filter = get_abbr(b"F", b"Filter").ok().map(expand_inline_filter);
     if let Some(filter) = &filter {
         full.set("Filter", filter.clone());
     }
@@ -2287,7 +2311,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Comment decode and content_operations disagree in the vendored parser"]
     fn content_operations_match_content() {
         let streams: [&[u8]; 6] = [
             b"",
@@ -2342,7 +2365,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "vendored string parser stops at the first unbalanced parenthesis"]
     fn parse_string() {
         let literal_string = |i| tstrip(literal_string(i));
 

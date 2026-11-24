@@ -750,9 +750,12 @@ impl Document {
     pub fn add_page_contents(&mut self, page_id: ObjectId, content: Vec<u8>) -> Result<()> {
         let page = self.get_dictionary(page_id)?;
         let mut current_content_list: Vec<Object> = match page.get(b"Contents") {
-            Ok(Object::Reference(id)) => {
-                vec![Object::Reference(*id)]
-            }
+            // /Contents is often a reference to an array of streams; append to that
+            // array rather than wrapping the reference itself (ISO 32000-1, 7.8.2).
+            Ok(Object::Reference(id)) => match self.get_object(*id) {
+                Ok(Object::Array(arr)) => arr.clone(),
+                _ => vec![Object::Reference(*id)],
+            },
             Ok(Object::Array(arr)) => arr.clone(),
             _ => vec![],
         };

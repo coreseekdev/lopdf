@@ -284,6 +284,15 @@ impl Document {
         let contents = self
             .get_dictionary(page_id)
             .and_then(|page| page.get(b"Contents"))?;
+        // A reference may point at an array of streams; replace through that array
+        // rather than overwriting the reference as if it were a single stream.
+        let contents = match contents {
+            Object::Reference(id) => match self.get_object(*id) {
+                Ok(array @ Object::Array(_)) => array,
+                _ => contents,
+            },
+            _ => contents,
+        };
         match contents {
             Object::Reference(id) => self.change_content_stream(*id, content),
             Object::Array(arr) => {
