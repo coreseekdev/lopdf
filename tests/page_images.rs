@@ -63,7 +63,6 @@ fn image_ids(doc: &Document, page_id: ObjectId) -> Vec<ObjectId> {
 /// `/Resources` is inheritable, so a page without its own uses the one of the nearest
 /// ancestor in the page tree, whether that one is a reference or written directly.
 #[test]
-#[ignore = "vendored get_page_images does not inherit /Resources"]
 fn page_images_from_inherited_resources() {
     let mut tree = page_tree();
     let resources_id = tree.doc.add_object(dictionary! {
@@ -86,7 +85,6 @@ fn page_images_from_inherited_resources() {
 /// Inherited resources are replaced, not merged: a page with its own `/Resources` doesn't
 /// see the images of its ancestors. A page with no resources at all has no images.
 #[test]
-#[ignore = "vendored get_page_images does not inherit /Resources"]
 fn page_images_from_nearest_resources_only() {
     let mut tree = page_tree();
     tree.doc.get_dictionary_mut(tree.root_id).unwrap().set(
@@ -105,7 +103,6 @@ fn page_images_from_nearest_resources_only() {
 
 /// A `/Parent` cycle is reported instead of being followed forever.
 #[test]
-#[ignore = "vendored get_page_images does not inherit /Resources"]
 fn page_images_with_parent_cycle() {
     let mut tree = page_tree();
     tree.doc

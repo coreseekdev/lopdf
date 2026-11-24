@@ -38,7 +38,6 @@ fn page_resources(doc: &Document, page_id: ObjectId) -> &Dictionary {
 /// `/Resources` is inheritable (ISO 32000-1, 7.7.3.4). A page that has none must not get an
 /// empty dictionary when a resource is added to it, as that would hide the inherited one.
 #[test]
-#[ignore = "vendored resource helpers do not inherit or follow references"]
 fn add_xobject_keeps_inherited_resources() {
     let (mut doc, page_id, font_id) = page_inheriting_font();
     let xobject_id = doc.add_object(dictionary! {});
@@ -57,7 +56,6 @@ fn add_xobject_keeps_inherited_resources() {
 }
 
 #[test]
-#[ignore = "vendored resource helpers do not inherit or follow references"]
 fn add_graphics_state_keeps_inherited_resources() {
     let (mut doc, page_id, font_id) = page_inheriting_font();
     let gs_id = doc.add_object(dictionary! { "Type" => "ExtGState", "CA" => 0.5 });
@@ -71,7 +69,6 @@ fn add_graphics_state_keeps_inherited_resources() {
 }
 
 #[test]
-#[ignore = "vendored resource helpers do not inherit or follow references"]
 fn incremental_add_xobject_keeps_inherited_resources() {
     let (mut doc, page_id, font_id) = page_inheriting_font();
     let mut bytes = Vec::new();
@@ -120,7 +117,6 @@ fn page_with_referenced_ext_g_state() -> (Document, ObjectId, ObjectId, ObjectId
 }
 
 #[test]
-#[ignore = "vendored resource helpers do not inherit or follow references"]
 fn add_graphics_state_to_referenced_ext_g_state() {
     let (mut doc, page_id, states_id, gs0_id) = page_with_referenced_ext_g_state();
     let gs1_id = doc.add_object(dictionary! { "Type" => "ExtGState", "CA" => 0.5 });
@@ -134,7 +130,6 @@ fn add_graphics_state_to_referenced_ext_g_state() {
 }
 
 #[test]
-#[ignore = "vendored resource helpers do not inherit or follow references"]
 fn incremental_add_graphics_state_to_referenced_ext_g_state() {
     let (mut doc, page_id, states_id, gs0_id) = page_with_referenced_ext_g_state();
     let mut bytes = Vec::new();
@@ -181,7 +176,6 @@ fn page_with_referenced_xobjects() -> (Document, ObjectId, ObjectId, ObjectId) {
 }
 
 #[test]
-#[ignore = "vendored resource helpers do not inherit or follow references"]
 fn incremental_add_xobject_to_referenced_xobjects() {
     let (mut doc, page_id, xobjects_id, x0_id) = page_with_referenced_xobjects();
     let mut bytes = Vec::new();
@@ -229,7 +223,6 @@ fn base_font<'a>(fonts: &BTreeMap<Vec<u8>, &'a Dictionary>, name: &[u8]) -> &'a 
 }
 
 #[test]
-#[ignore = "vendored resource helpers do not inherit or follow references"]
 fn page_fonts_from_inherited_resources_dictionary() {
     let (mut doc, page_id) = page_inheriting_font_directly();
     let fonts = doc.get_page_fonts(page_id).unwrap();

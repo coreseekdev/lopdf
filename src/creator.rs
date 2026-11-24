@@ -119,21 +119,26 @@ impl Document {
     /// Get the page's resource dictionary.
     ///
     /// Get Object that has the key "Resources".
+    ///
+    /// A page without its own `/Resources` gets a copy of the one it inherits from the page
+    /// tree, if any, so that adding a resource does not hide the inherited ones
+    /// (ISO 32000-1, 7.7.3.4).
     pub fn get_or_create_resources(&mut self, page_id: ObjectId) -> Result<&mut Object> {
-        let resources_id = {
+        let (resources_id, inherited) = {
             let page = self.get_object(page_id).and_then(Object::as_dict)?;
-            if page.has(b"Resources") {
-                page.get(b"Resources").and_then(Object::as_reference).ok()
-            } else {
-                None
+            match page.get(b"Resources") {
+                Ok(Object::Reference(id)) => (Some(*id), None),
+                Ok(Object::Dictionary(_)) => (None, None),
+                // Missing, or explicit null which counts as absent (ISO 32000-1, 7.3.9).
+                _ => (None, self.inherited_resources(page).ok().flatten().cloned()),
             }
         };
         if let Some(res_id) = resources_id {
             return self.get_object_mut(res_id);
         }
         let page = self.get_object_mut(page_id).and_then(Object::as_dict_mut)?;
-        if !page.has(b"Resources") {
-            page.set(b"Resources", Dictionary::new());
+        if !matches!(page.get(b"Resources"), Ok(Object::Dictionary(_))) {
+            page.set(b"Resources", inherited.unwrap_or_default());
         }
         page.get_mut(b"Resources")
     }
@@ -184,9 +189,11 @@ impl Document {
             if !resources.has(b"ExtGState") {
                 resources.set("ExtGState", Dictionary::new());
             }
-            let states = resources
-                .get_mut(b"ExtGState")
-                .and_then(Object::as_dict_mut)?;
+            let mut states = resources.get_mut(b"ExtGState")?;
+            if let Object::Reference(states_id) = *states {
+                states = self.get_object_mut(states_id)?;
+            }
+            let states = Object::as_dict_mut(states)?;
             states.set(gs_name, Object::Reference(gs_id));
         }
         Ok(())
