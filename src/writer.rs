@@ -74,6 +74,15 @@ impl Document {
     }
 
     fn save_internal<W: Write>(&mut self, target: &mut W) -> Result<()> {
+        // Cross-reference streams arrived in PDF 1.5, so the header must
+        // advertise at least that version even when the caller set the xref
+        // type directly instead of going through `save_with_options`.
+        if matches!(self.reference_table.cross_reference_type, XrefType::CrossReferenceStream)
+            && self.version.as_str() < "1.5"
+        {
+            self.version = "1.5".to_string();
+        }
+
         let mut target = CountingWrite {
             inner: target,
             bytes_written: 0,

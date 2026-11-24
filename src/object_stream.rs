@@ -87,8 +87,15 @@ impl ObjectStream {
 
         let numbers_str = std::str::from_utf8(index_block)
             .map_err(|e| Error::InvalidObjectStream(e.to_string()))?;
+        // An index block may carry comments between or after the pairs.
+        // pdfium tokenises the block line by line and skips everything from a
+        // "%" to the end of the line before parsing the numbers
+        // (cpdf_syntax_parser.cpp: GetBlock / GetNextWord), so strip them
+        // per line here as well.
         let numbers: Vec<_> = numbers_str
-            .split_whitespace()
+            .split(['\r', '\n'])
+            .flat_map(|line| line.split('%').next())
+            .flat_map(str::split_whitespace)
             .map(|number| u32::from_str(number).ok())
             .collect();
         let n = stream.dict.get(b"N").and_then(Object::as_i64)?;
@@ -115,11 +122,13 @@ impl ObjectStream {
                 warn!("out-of-bounds offset in object stream");
                 return None;
             }
-            // Skip leading whitespace — some PDFs emit newlines before objects in ObjStm
-            let mut start = offset;
-            while start < content.len() && content[start].is_ascii_whitespace() {
-                start += 1;
-            }
+            // Skip leading whitespace and comments — some PDFs emit newlines
+            // or comments before objects in an ObjStm, and the PDF syntax
+            // treats a comment as white space (ISO 32000-1 7.2.4).
+            let start = match parser::space(&content[offset..]) {
+                Ok((rest, ())) => content.len() - rest.len(),
+                Err(_) => offset,
+            };
             if start >= content.len() {
                 warn!("only whitespace after offset in object stream");
                 return None;

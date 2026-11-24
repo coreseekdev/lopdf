@@ -8,7 +8,7 @@ use std::fs::File;
 #[cfg(not(feature = "async"))]
 use std::io::Read;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(feature = "rayon")]
 use rayon::prelude::*;
@@ -723,6 +723,12 @@ pub struct Reader<'a> {
     /// while another object is being parsed.  Bounded so it cannot grow with
     /// the document.
     range_objects: Mutex<VecDeque<(ObjectId, Object)>>,
+    /// Stream payload ranges of a complete, immutable buffer, built on first
+    /// use.  The xref recovery searches consult them after every failed
+    /// offset; rescanning the whole file each time would be quadratic in a
+    /// damaged document.  Only valid while `sparse` and `range_source` are
+    /// `None`, because those modes move or fill the buffer between calls.
+    stream_payloads: OnceLock<Vec<(usize, usize)>>,
 }
 
 /// How many indirect `/Length` objects stay resolved for the parser's
@@ -862,6 +868,7 @@ impl<'a> Reader<'a> {
             sparse: None,
             window_base: 0,
             range_objects: Mutex::new(VecDeque::new()),
+            stream_payloads: OnceLock::new(),
         };
         reader.filled.push((0, reader.buffer.len()));
         reader
@@ -880,6 +887,8 @@ impl<'a> Reader<'a> {
             self.buffer_base += offset;
             return;
         }
+        // The byte layout changed, so any cached payload ranges are stale.
+        self.stream_payloads = OnceLock::new();
         let buffer = std::mem::replace(&mut self.buffer, Cow::Borrowed(&[]));
         self.buffer = match buffer {
             Cow::Borrowed(bytes) => Cow::Borrowed(&bytes[offset..]),
@@ -1043,6 +1052,7 @@ impl<'a> Reader<'a> {
                 }
             }
             self.buffer = Cow::Owned(buffer);
+            self.stream_payloads = OnceLock::new();
             self.window_base = 0;
             self.filled.clear();
             self.filled.push((0, len));
@@ -1074,6 +1084,7 @@ impl<'a> Reader<'a> {
             store.trim();
         }
         self.buffer = Cow::Owned(bytes);
+        self.stream_payloads = OnceLock::new();
         self.window_base = start;
         Ok(())
     }
@@ -2534,12 +2545,19 @@ impl<'a> Reader<'a> {
         let start = relative.saturating_sub(WINDOW);
         let end = (relative + WINDOW).min(self.buffer.len());
         let window = self.buffer.get(start..end)?;
+        // A candidate inside a stream payload is part of opaque stream data,
+        // not an object header; only ranges visible in the current window can
+        // be judged, which is enough to reject the bytes we did inspect.
+        let payloads = self.payload_ranges();
         let mut best: Option<(usize, usize)> = None;
         for position in 0..window.len() {
             if Self::parse_object_header(&window[position..]) != Some(expected_id) {
                 continue;
             }
             let absolute = start + position;
+            if Self::within_payload(payloads.as_ref(), absolute) {
+                continue;
+            }
             let distance = absolute.abs_diff(relative);
             if best.is_none_or(|(best_distance, _)| distance < best_distance) {
                 best = Some((distance, absolute));
@@ -2553,6 +2571,16 @@ impl<'a> Reader<'a> {
     /// real header (for example at the preceding `endobj`).
     fn find_nearby_object_header(&self, offset: usize, expected_id: ObjectId) -> Option<usize> {
         const WINDOW: usize = 4096;
+        // An offset that lands inside a stream payload is not a near miss but
+        // damage: the bytes there are opaque stream data, and the header of
+        // another object lying within the window must not be mistaken for the
+        // requested one.  Keeping the original parse failure follows pdfium,
+        // which parses the offset it was given rather than scanning stream
+        // bodies for a header (cpdf_parser.cpp: ParseIndirectObject).
+        let payloads = self.payload_ranges();
+        if Self::within_payload(payloads.as_ref(), offset) {
+            return None;
+        }
         let start = offset.saturating_sub(WINDOW);
         let end = (offset + WINDOW).min(self.buffer.len());
         let window = self.buffer.get(start..end)?;
@@ -2562,6 +2590,9 @@ impl<'a> Reader<'a> {
                 continue;
             }
             let absolute = start + position;
+            if Self::within_payload(payloads.as_ref(), absolute) {
+                continue;
+            }
             let distance = absolute.abs_diff(offset);
             if best.is_none_or(|(best_distance, _)| distance < best_distance) {
                 best = Some((distance, absolute));
@@ -3231,6 +3262,30 @@ impl<'a> Reader<'a> {
             trailers.push((pos, dict));
         }
         trailers
+    }
+
+    /// Stream payload ranges for the current buffer.
+    ///
+    /// The ranges are cached once when the buffer is complete and immutable;
+    /// a moving sparse window or a still-filling range buffer is rescanned on
+    /// each call instead, which only happens on the failure path.
+    fn payload_ranges(&self) -> Cow<'_, [(usize, usize)]> {
+        if self.sparse.is_none() && self.range_source.is_none() {
+            Cow::Borrowed(
+                self.stream_payloads
+                    .get_or_init(|| Self::stream_payload_ranges(&self.buffer))
+                    .as_slice(),
+            )
+        } else {
+            Cow::Owned(Self::stream_payload_ranges(&self.buffer))
+        }
+    }
+
+    /// Whether `offset` falls strictly inside one of `ranges`.
+    fn within_payload(ranges: &[(usize, usize)], offset: usize) -> bool {
+        ranges
+            .iter()
+            .any(|&(start, end)| start <= offset && offset < end)
     }
 
     /// The byte ranges occupied by stream payloads.  A `stream` keyword only

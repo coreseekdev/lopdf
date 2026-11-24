@@ -698,6 +698,32 @@ pub fn decode_xref_stream_with_limit(
             return Err(ParseError::InvalidXref.into());
         }
 
+        // A record narrower than three decoded bytes cannot address an object
+        // at all, yet still retains a full map entry. Flooring the effective
+        // width caps that amplification independently of the decompression
+        // budget (a `/W [0 1 0]` stream would otherwise convert one byte into
+        // one entry).
+        const MIN_ENTRY_WIDTH: usize = 3;
+
+        // `/Index` is untrusted: every count must be non-negative, their sum
+        // must not overflow, and no more records may be declared than the
+        // decoded body can hold.
+        let body_len = reader.get_ref().len();
+        let mut declared_entries: u64 = 0;
+        for section in section_indice.as_chunks::<2>().0 {
+            let count = section[1];
+            if count < 0 {
+                return Err(ParseError::InvalidXref.into());
+            }
+            declared_entries = declared_entries
+                .checked_add(u64::try_from(count).map_err(|_| ParseError::InvalidXref)?)
+                .ok_or(ParseError::InvalidXref)?;
+        }
+        let fitting_entries = (body_len / entry_width.max(MIN_ENTRY_WIDTH)) as u64;
+        if declared_entries > fitting_entries {
+            return Err(ParseError::InvalidXref.into());
+        }
+
         // A truncated producer may declare more /Index entries than the decoded body
         // carries (a cut-off predictor row leaves at most `entry_width - 1` bytes). The
         // loop below stops at the last record that fits, so the declared count never

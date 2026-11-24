@@ -110,7 +110,7 @@ fn is_regular(c: u8) -> bool {
 }
 
 #[inline]
-fn space(input: ParserInput) -> NomResult<()> {
+pub(crate) fn space(input: ParserInput) -> NomResult<()> {
     let mut rest = input;
     loop {
         let bytes = rest;

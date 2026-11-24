@@ -22,6 +22,16 @@ enum PasswordRole {
     Either,
 }
 
+/// References discovered while walking a document from its trailer.
+///
+/// `order` preserves the first-visit order that `traverse_objects` returns,
+/// while `seen` answers "was this object already reached" in constant time.
+#[derive(Debug, Default)]
+pub(crate) struct TraversedReferences {
+    pub(crate) order: Vec<ObjectId>,
+    pub(crate) seen: HashSet<ObjectId>,
+}
+
 /// A PDF document.
 ///
 /// This can both be a combination of multiple incremental updates
@@ -248,11 +258,25 @@ impl Document {
     }
 
     /// Traverse objects from trailer recursively, return all referenced object IDs.
+    ///
+    /// The returned IDs are in first-visit order; see
+    /// [`Document::traverse_objects_inner`] when the caller also needs the
+    /// membership set (e.g. to test containment without a linear scan).
     pub fn traverse_objects<A: Fn(&mut Object)>(&mut self, action: A) -> Vec<ObjectId> {
+        self.traverse_objects_inner(&action).order
+    }
+
+    /// Traversal core shared by [`Document::traverse_objects`] and
+    /// [`crate::Processor::prune_objects`].
+    ///
+    /// Deduplication used to be a linear `Vec::contains`, which made traversing
+    /// a document quadratic in the number of references. A `HashSet` keeps the
+    /// first-visit order in `order` while answering membership in constant time.
+    pub(crate) fn traverse_objects_inner<A: Fn(&mut Object)>(&mut self, action: &A) -> TraversedReferences {
         fn traverse_array<A: Fn(&mut Object)>(
             array: &mut [Object],
             action: &A,
-            refs: &mut Vec<ObjectId>,
+            refs: &mut TraversedReferences,
         ) {
             for item in array.iter_mut() {
                 traverse_object(item, action, refs);
@@ -261,7 +285,7 @@ impl Document {
         fn traverse_dictionary<A: Fn(&mut Object)>(
             dict: &mut Dictionary,
             action: &A,
-            refs: &mut Vec<ObjectId>,
+            refs: &mut TraversedReferences,
         ) {
             for (_, v) in dict.iter_mut() {
                 traverse_object(v, action, refs);
@@ -270,25 +294,28 @@ impl Document {
         fn traverse_object<A: Fn(&mut Object)>(
             object: &mut Object,
             action: &A,
-            refs: &mut Vec<ObjectId>,
+            refs: &mut TraversedReferences,
         ) {
             action(object);
             match object {
                 Object::Array(array) => traverse_array(array, action, refs),
                 Object::Dictionary(dict) => traverse_dictionary(dict, action, refs),
                 Object::Stream(stream) => traverse_dictionary(&mut stream.dict, action, refs),
-                Object::Reference(id) if !refs.contains(id) => {
-                    refs.push(*id);
+                Object::Reference(id) => {
+                    if refs.seen.insert(*id) {
+                        refs.order.push(*id);
+                    }
                 }
                 _ => {}
             }
         }
-        let mut refs = vec![];
-        traverse_dictionary(&mut self.trailer, &action, &mut refs);
+        let mut refs = TraversedReferences::default();
+        traverse_dictionary(&mut self.trailer, action, &mut refs);
         let mut index = 0;
-        while index < refs.len() {
-            if let Some(object) = self.objects.get_mut(&refs[index]) {
-                traverse_object(object, &action, &mut refs);
+        while index < refs.order.len() {
+            let id = refs.order[index];
+            if let Some(object) = self.objects.get_mut(&id) {
+                traverse_object(object, action, &mut refs);
             }
             index += 1;
         }

@@ -74,9 +74,11 @@ impl Document {
     /// Prune all unused objects.
     pub fn prune_objects(&mut self) -> Vec<ObjectId> {
         let mut ids = vec![];
-        let refs = self.traverse_objects(|_| {});
+        // Use the traversal's membership set: a linear `Vec::contains` per
+        // object made pruning quadratic in the document size.
+        let refs = self.traverse_objects_inner(&|_| {});
         for id in self.objects.keys() {
-            if !refs.contains(id) {
+            if !refs.seen.contains(id) {
                 ids.push(*id);
             }
         }
