@@ -37,7 +37,6 @@ fn test_object_stream_parse_preserves_encoded_content() {
 }
 
 #[test]
-#[ignore = "vendored parser mutates input on unsupported filters"]
 fn test_object_stream_parse_reports_unsupported_filters_without_mutating_input() {
     let encoded = b"1 0 << >>".to_vec();
     let stream = Stream::new(

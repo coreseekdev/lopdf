@@ -1473,7 +1473,16 @@ impl Stream {
     /// variants. `limit` is `None` to decode without a size limit, or
     /// `Some(max)` to cap the decoded output at `max` bytes per filter layer.
     fn decode_filters(&self, limit: Option<usize>) -> Result<Vec<u8>> {
-        Ok(self.decode_filters_until_image(limit)?.0)
+        let (data, stopped_at_image) = self.decode_filters_until_image(limit)?;
+        // A stream that ends in an image codec (or any unknown filter) has not
+        // been fully decoded. Returning the bytes decoded so far would hand the
+        // caller compressed image data as if it were plain content — an object
+        // stream with such a filter would then be parsed as text. Only the
+        // image-specific entry point above asks for that partial data.
+        if stopped_at_image {
+            return Err(Error::Unimplemented("decompression algorithms"));
+        }
+        Ok(data)
     }
 
     fn decompress_brotli(

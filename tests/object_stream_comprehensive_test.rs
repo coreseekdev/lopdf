@@ -5,7 +5,6 @@ use lopdf::{Document, Object, ObjectStream, Stream, StringFormat, dictionary};
 /// with `/Encrypt`, the cross-reference and object streams themselves, and the
 /// catalog of a linearized document.
 #[test]
-#[ignore = "vendored compressible-object rules differ"]
 fn can_be_compressed_excludes_the_documented_objects() {
     let mut doc = Document::new();
 

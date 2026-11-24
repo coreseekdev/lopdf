@@ -21,7 +21,7 @@ use tokio::pin;
 
 use crate::common_data_structures;
 use crate::encryption::{self, EncryptionState, PasswordAlgorithm};
-use crate::error::{ParseError, XrefError};
+use crate::error::{DecompressError, ParseError, XrefError};
 use crate::load_options::{FilterFunc, LoadOptions};
 use crate::object_stream::ObjectStream;
 use crate::parser;
@@ -1696,7 +1696,18 @@ impl<'a> Reader<'a> {
                                 }
                             }
                         }
-                        Err(_e) => {}
+                        Err(error @ Error::Decompress(DecompressError::MemoryLimitExceeded { .. })) => {
+                            // A resource limit is not a malformed object: the
+                            // caller asked for a bound and must see it enforced
+                            // even on a lenient load.
+                            return Err(error);
+                        }
+                        Err(error) => {
+                            if self.strict {
+                                return Err(error);
+                            }
+                            warn!("Object stream load error for {container_id} 0 R: {error:?}");
+                        }
                     }
                 }
             }
@@ -1802,6 +1813,12 @@ impl<'a> Reader<'a> {
                                 self.max_decompressed_size,
                             ) {
                                 Ok(obj_stream) => obj_stream,
+                                // A resource limit is not a malformed object: the
+                                // caller asked for a bound and must see it enforced
+                                // even on a lenient load.
+                                Err(e @ Error::Decompress(DecompressError::MemoryLimitExceeded { .. })) => {
+                                    return Err(e);
+                                }
                                 // Not an encryption-related loss, so it obeys the same
                                 // strict-mode policy as any other load error.
                                 Err(e) => {

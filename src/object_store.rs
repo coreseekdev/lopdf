@@ -8,10 +8,16 @@
 //! gigabytes for nothing.  Numbers at or above [`DENSE_LIMIT`] therefore live
 //! in a `BTreeMap` that costs one entry per object, not one slot per id.
 //!
+//! An object's generation is part of its key (ISO 32000-1 7.5.4): the same
+//! object number may exist at generation 0 in the current cross-reference
+//! section and at another generation in an earlier one.  Only generation 0
+//! objects use the dense `Vec`; every other generation lives in the sparse map,
+//! so inserting `(1, 5)` never replaces `(1, 0)`.
+//!
 //! Both halves keep the same public semantics as the old map: iteration is in
-//! ascending `ObjectId` order (dense ids are all below the limit, overflow ids
-//! all at or above it), `len` counts objects, and generations stay part of the
-//! key comparison.
+//! ascending `ObjectId` order (dense ids are all below the limit and at
+//! generation 0), `len` counts objects, and generations stay part of the key
+//! comparison.
 
 use std::collections::BTreeMap;
 use std::ops::Index;
@@ -27,8 +33,11 @@ pub(crate) const DENSE_LIMIT: u32 = 1 << 20;
 /// A flat dense prefix plus a sparse tail, both keyed by `ObjectId`.
 #[derive(Debug, Clone, Default)]
 pub struct ObjectStore {
+    /// Generation 0 objects with a number below [`DENSE_LIMIT`].
     entries: Vec<Option<(ObjectId, Object)>>,
-    overflow: BTreeMap<u32, (ObjectId, Object)>,
+    /// Every other object: a non-zero generation, or a number at or above
+    /// [`DENSE_LIMIT`].  Keyed by the whole `ObjectId`, so generations coexist.
+    sparse: BTreeMap<ObjectId, Object>,
     len: usize,
 }
 
@@ -36,21 +45,28 @@ type DenseRef<'a> = std::iter::FilterMap<
     std::slice::Iter<'a, Option<(ObjectId, Object)>>,
     fn(&'a Option<(ObjectId, Object)>) -> Option<(&'a ObjectId, &'a Object)>,
 >;
-type OverflowRef<'a> = std::iter::Map<
-    std::collections::btree_map::Iter<'a, u32, (ObjectId, Object)>,
-    fn((&'a u32, &'a (ObjectId, Object))) -> (&'a ObjectId, &'a Object),
->;
-type StoreIter<'a> = std::iter::Chain<DenseRef<'a>, OverflowRef<'a>>;
 
 type DenseMut<'a> = std::iter::FilterMap<
     std::slice::IterMut<'a, Option<(ObjectId, Object)>>,
     fn(&'a mut Option<(ObjectId, Object)>) -> Option<(&'a ObjectId, &'a mut Object)>,
 >;
-type OverflowMut<'a> = std::iter::Map<
-    std::collections::btree_map::IterMut<'a, u32, (ObjectId, Object)>,
-    fn((&'a u32, &'a mut (ObjectId, Object))) -> (&'a ObjectId, &'a mut Object),
->;
-type StoreIterMut<'a> = std::iter::Chain<DenseMut<'a>, OverflowMut<'a>>;
+
+/// Iterator over an [`ObjectStore`] in ascending `ObjectId` order.
+///
+/// The common case (no sparse entries) is a plain iteration over the dense
+/// half.  When sparse entries exist their ids interleave with the dense ones,
+/// so the two sorted sequences are merged up front; sparse entries are rare by
+/// construction, so this branch costs nothing for ordinary documents.
+pub enum ObjectStoreIter<'a> {
+    Dense(DenseRef<'a>),
+    Merged(std::vec::IntoIter<(&'a ObjectId, &'a Object)>),
+}
+
+/// Mutable counterpart of [`ObjectStoreIter`].
+pub enum ObjectStoreIterMut<'a> {
+    Dense(DenseMut<'a>),
+    Merged(std::vec::IntoIter<(&'a ObjectId, &'a mut Object)>),
+}
 
 // The explicit lifetimes are required so these function items coerce to the
 // concrete `fn` pointer types in the iterator aliases above.
@@ -60,24 +76,64 @@ fn dense_ref<'a>(entry: &'a Option<(ObjectId, Object)>) -> Option<(&'a ObjectId,
 }
 
 #[allow(clippy::needless_lifetimes)]
-fn overflow_ref<'a>(pair: (&'a u32, &'a (ObjectId, Object))) -> (&'a ObjectId, &'a Object) {
-    let (id, object) = pair.1;
-    (id, object)
-}
-
-#[allow(clippy::needless_lifetimes)]
 fn dense_mut<'a>(
     entry: &'a mut Option<(ObjectId, Object)>,
 ) -> Option<(&'a ObjectId, &'a mut Object)> {
     entry.as_mut().map(|(id, object)| (&*id, object))
 }
 
-#[allow(clippy::needless_lifetimes)]
-fn overflow_mut<'a>(
-    pair: (&'a u32, &'a mut (ObjectId, Object)),
-) -> (&'a ObjectId, &'a mut Object) {
-    let (id, object) = pair.1;
-    (&*id, object)
+impl<'a> Iterator for ObjectStoreIter<'a> {
+    type Item = (&'a ObjectId, &'a Object);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Dense(iter) => iter.next(),
+            Self::Merged(iter) => iter.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Dense(iter) => iter.size_hint(),
+            Self::Merged(iter) => iter.size_hint(),
+        }
+    }
+}
+
+impl DoubleEndedIterator for ObjectStoreIter<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Dense(iter) => iter.next_back(),
+            Self::Merged(iter) => iter.next_back(),
+        }
+    }
+}
+
+impl<'a> Iterator for ObjectStoreIterMut<'a> {
+    type Item = (&'a ObjectId, &'a mut Object);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Dense(iter) => iter.next(),
+            Self::Merged(iter) => iter.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Dense(iter) => iter.size_hint(),
+            Self::Merged(iter) => iter.size_hint(),
+        }
+    }
+}
+
+impl DoubleEndedIterator for ObjectStoreIterMut<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Dense(iter) => iter.next_back(),
+            Self::Merged(iter) => iter.next_back(),
+        }
+    }
 }
 
 impl ObjectStore {
@@ -93,28 +149,27 @@ impl ObjectStore {
         self.len == 0
     }
 
+    /// Whether `id` belongs in the dense half: generation 0 and a small number.
     #[inline]
-    fn is_overflow(id: ObjectId) -> bool {
-        id.0 >= DENSE_LIMIT
+    fn is_dense(id: ObjectId) -> bool {
+        id.1 == 0 && id.0 < DENSE_LIMIT
     }
 
     pub fn get(&self, id: &ObjectId) -> Option<&Object> {
-        if Self::is_overflow(*id) {
-            let (stored, object) = self.overflow.get(&id.0)?;
-            (*stored == *id).then_some(object)
-        } else {
+        if Self::is_dense(*id) {
             let entry = self.entries.get(id.0 as usize)?.as_ref()?;
             (entry.0 == *id).then_some(&entry.1)
+        } else {
+            self.sparse.get(id)
         }
     }
 
     pub fn get_mut(&mut self, id: &ObjectId) -> Option<&mut Object> {
-        if Self::is_overflow(*id) {
-            let (stored, object) = self.overflow.get_mut(&id.0)?;
-            (*stored == *id).then_some(object)
-        } else {
+        if Self::is_dense(*id) {
             let entry = self.entries.get_mut(id.0 as usize)?.as_mut()?;
             (entry.0 == *id).then_some(&mut entry.1)
+        } else {
+            self.sparse.get_mut(id)
         }
     }
 
@@ -129,12 +184,14 @@ impl ObjectStore {
             id.0,
             MAX_OBJECT_NUMBER
         );
-        if Self::is_overflow(id) {
-            let previous = self.overflow.insert(id.0, (id, object));
-            if previous.is_none() {
-                self.len += 1;
-            }
-            return previous.and_then(|(previous_id, object)| (previous_id == id).then_some(object));
+        if !Self::is_dense(id) {
+            return match self.sparse.insert(id, object) {
+                Some(previous) => Some(previous),
+                None => {
+                    self.len += 1;
+                    None
+                }
+            };
         }
         let index = id.0 as usize;
         if self.entries.len() <= index {
@@ -150,15 +207,10 @@ impl ObjectStore {
     }
 
     pub fn remove(&mut self, id: &ObjectId) -> Option<Object> {
-        if Self::is_overflow(*id) {
-            let slot = self.overflow.remove(&id.0)?;
-            if slot.0 != *id {
-                // Put a different generation back; the requested id is absent.
-                self.overflow.insert(id.0, slot);
-                return None;
-            }
+        if !Self::is_dense(*id) {
+            let object = self.sparse.remove(id)?;
             self.len -= 1;
-            return Some(slot.1);
+            return Some(object);
         }
         let slot = self.entries.get_mut(id.0 as usize)?.take()?;
         if slot.0 != *id {
@@ -170,18 +222,42 @@ impl ObjectStore {
         Some(slot.1)
     }
 
-    pub fn iter(&self) -> impl DoubleEndedIterator<Item = (&ObjectId, &Object)> {
-        self.entries
+    /// The dense entries and sparse entries are each sorted by `ObjectId`; when
+    /// both are present they are merged so callers still see one ascending
+    /// sequence.  Sparse entries are rare, and a document that has any pays a
+    /// single `O(n log n)` sort per iteration rather than a per-step merge.
+    fn merged_refs(&self) -> Vec<(&ObjectId, &Object)> {
+        let mut all: Vec<(&ObjectId, &Object)> = self
+            .entries
             .iter()
             .filter_map(dense_ref as fn(_) -> _)
-            .chain(self.overflow.iter().map(overflow_ref as fn(_) -> _))
+            .chain(self.sparse.iter())
+            .collect();
+        all.sort_unstable_by_key(|(id, _)| **id);
+        all
     }
 
-    pub fn iter_mut(&mut self) -> impl DoubleEndedIterator<Item = (&ObjectId, &mut Object)> {
-        self.entries
-            .iter_mut()
-            .filter_map(dense_mut as fn(_) -> _)
-            .chain(self.overflow.iter_mut().map(overflow_mut as fn(_) -> _))
+    pub fn iter(&self) -> ObjectStoreIter<'_> {
+        if self.sparse.is_empty() {
+            ObjectStoreIter::Dense(self.entries.iter().filter_map(dense_ref as fn(_) -> _))
+        } else {
+            ObjectStoreIter::Merged(self.merged_refs().into_iter())
+        }
+    }
+
+    pub fn iter_mut(&mut self) -> ObjectStoreIterMut<'_> {
+        if self.sparse.is_empty() {
+            ObjectStoreIterMut::Dense(self.entries.iter_mut().filter_map(dense_mut as fn(_) -> _))
+        } else {
+            let mut all: Vec<(&ObjectId, &mut Object)> = self
+                .entries
+                .iter_mut()
+                .filter_map(dense_mut as fn(_) -> _)
+                .chain(self.sparse.iter_mut())
+                .collect();
+            all.sort_unstable_by_key(|(id, _)| **id);
+            ObjectStoreIterMut::Merged(all.into_iter())
+        }
     }
 
     pub fn keys(&self) -> impl DoubleEndedIterator<Item = &ObjectId> {
@@ -207,25 +283,19 @@ impl Index<&ObjectId> for ObjectStore {
 
 impl<'a> IntoIterator for &'a ObjectStore {
     type Item = (&'a ObjectId, &'a Object);
-    type IntoIter = StoreIter<'a>;
+    type IntoIter = ObjectStoreIter<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.entries
-            .iter()
-            .filter_map(dense_ref as fn(_) -> _)
-            .chain(self.overflow.iter().map(overflow_ref as fn(_) -> _))
+        self.iter()
     }
 }
 
 impl<'a> IntoIterator for &'a mut ObjectStore {
     type Item = (&'a ObjectId, &'a mut Object);
-    type IntoIter = StoreIterMut<'a>;
+    type IntoIter = ObjectStoreIterMut<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.entries
-            .iter_mut()
-            .filter_map(dense_mut as fn(_) -> _)
-            .chain(self.overflow.iter_mut().map(overflow_mut as fn(_) -> _))
+        self.iter_mut()
     }
 }
 
