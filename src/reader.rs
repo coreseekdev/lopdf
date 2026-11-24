@@ -691,6 +691,9 @@ pub struct Reader<'a> {
     /// `None` (the default) applies no limit; set it to guard against
     /// decompression bombs. See [`crate::LoadOptions`].
     pub max_decompressed_size: Option<usize>,
+    /// Rebuild the cross-reference table before reading it, even if the
+    /// stored table resolves.  See [`LoadOptions::force_reconstruct`].
+    force_reconstruct: bool,
     /// Intern large structurally identical dictionaries while loading.
     intern_dictionaries: bool,
     /// Persistent intern table for lazily fetched objects; the same table
@@ -858,6 +861,7 @@ impl<'a> Reader<'a> {
             password: options.password,
             strict: options.strict,
             max_decompressed_size: options.max_decompressed_size,
+            force_reconstruct: options.force_reconstruct,
             intern_dictionaries: options.intern_dictionaries,
             dictionary_interner: Mutex::default(),
             normal_offsets: Vec::new(),
@@ -1563,18 +1567,27 @@ impl<'a> Reader<'a> {
             self.document.binary_mark = binary_mark;
         }
 
-        // Fall back to reconstruction only after all standard resolution fails.
-        let (xref, trailer) = match self.resolve_xref_and_trailer() {
-            Ok(resolved) => resolved,
-            Err(err) => match self.reconstruct_xref_and_trailer() {
-                Some(reconstructed) => {
-                    warn!(
-                        "cross-reference resolution failed ({err}); recovered by scanning for indirect objects"
-                    );
-                    reconstructed
-                }
-                None => return Err(err),
-            },
+        // A caller that knows the stored table is wrong can ask for the rebuilt
+        // one up front; otherwise reconstruction is the last resort.
+        let (xref, trailer) = if self.force_reconstruct {
+            match self.reconstruct_xref_and_trailer() {
+                Some(reconstructed) => reconstructed,
+                None => self.resolve_xref_and_trailer()?,
+            }
+        } else {
+            // Fall back to reconstruction only after all standard resolution fails.
+            match self.resolve_xref_and_trailer() {
+                Ok(resolved) => resolved,
+                Err(err) => match self.reconstruct_xref_and_trailer() {
+                    Some(reconstructed) => {
+                        warn!(
+                            "cross-reference resolution failed ({err}); recovered by scanning for indirect objects"
+                        );
+                        reconstructed
+                    }
+                    None => return Err(err),
+                },
+            }
         };
 
         self.document.version = version;
@@ -1612,7 +1625,7 @@ impl<'a> Reader<'a> {
         Ok(self.document)
     }
 
-    fn load_encrypted_document(&mut self, _filter_func: Option<FilterFunc>) -> Result<()> {
+    fn load_encrypted_document(&mut self, filter_func: Option<FilterFunc>) -> Result<()> {
         // First, extract all raw object bytes without parsing
         let entries: Vec<_> = self
             .document
@@ -1666,7 +1679,17 @@ impl<'a> Reader<'a> {
                 };
 
                 if let Ok((id, mut obj)) = self.parse_raw_object(raw_bytes) {
-                    let _ = encryption::decrypt_object(state, obj_id, &mut obj);
+                    // Keep the partial object, but do not drop the error silently.
+                    if let Err(error) = encryption::decrypt_object(state, obj_id, &mut obj) {
+                        warn!("object {obj_id:?} could not be fully decrypted: {error}");
+                    }
+
+                    if let Some(filter_func) = filter_func
+                        && filter_func(id, &mut obj).is_none()
+                    {
+                        continue;
+                    }
+
                     self.document.objects.insert(id, obj);
                 }
             }
@@ -1692,7 +1715,17 @@ impl<'a> Reader<'a> {
                                     object_stream.member_at(usize::from(index))
                                     && member_id == obj_id
                                 {
-                                    self.document.objects.insert(obj_id, object.clone());
+                                    let mut object = object.clone();
+                                    // Object-stream members are decrypted with their
+                                    // container, so the filter sees plaintext just as it
+                                    // does for a top-level object.
+                                    if let Some(filter_func) = filter_func
+                                        && filter_func(obj_id, &mut object).is_none()
+                                    {
+                                        continue;
+                                    }
+
+                                    self.document.objects.insert(obj_id, object);
                                 }
                             }
                         }

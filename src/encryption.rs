@@ -919,84 +919,102 @@ fn transform_object(
         return Ok(());
     }
 
-    // A stream's `/Crypt` filter may name a different crypt filter in the
-    // `/DecodeParms` entry that belongs to it; Identity is used when the name
-    // is absent (pdf.js parser.js:868-880, crypto.js:1305-1316).
-    let override_crypt_filter = obj
-        .as_stream()
-        .ok()
-        .and_then(|stream| crypt_filter_override(state, stream));
-
-    // Retrieve the payload and the crypt filter to use to transform it.
-    let (mut crypt_filter, payload) = match obj {
+    match obj {
         // Every string and stream is covered, so recurse into arrays and dictionaries
         // to reach the ones nested inside.
         Object::Array(objects) => {
-            for obj in objects {
-                transform_object(state, obj_id, obj, direction)?;
-            }
-
-            return Ok(());
-        }
-        Object::Dictionary(objects) => {
-            // A signature dictionary's /Contents holds the PKCS#7 blob and
-            // must stay ciphertext (pdfium DecryptObjectTree,
-            // cpdf_crypto_handler.cpp:253-333).  Names are not encrypted, so
-            // /Type and /FT can be checked before recursing.
-            let signature = is_signature_dictionary(objects);
-            for (key, obj) in objects.iter_mut() {
-                if signature && key.as_slice() == b"Contents" {
-                    continue;
+            let mut first_error = None;
+            for object in objects.iter_mut() {
+                if let Err(error) = transform_object(state, obj_id, object, direction) {
+                    first_error.get_or_insert(error);
                 }
-                transform_object(state, obj_id, obj, direction)?;
             }
-
-            return Ok(());
+            first_error.map_or(Ok(()), Err)
         }
-        // Encryption applies to all strings and streams in the document's PDF file. We return the
-        // crypt filter and the content here.
-        Object::String(content, _) => (state.get_string_filter(), content.as_slice()),
-        Object::Stream(stream) => (
-            state.get_stream_filter_for(stream.dict.has_type(b"EmbeddedFile")),
-            stream.content.as_slice(),
-        ),
+        Object::Dictionary(dictionary) => transform_dictionary(state, obj_id, dictionary, direction),
+        // The strings in a stream's dictionary use the string filter and its
+        // content the stream filter; both are covered (ISO 32000-1, 7.6.2, #603).
+        Object::Stream(stream) => {
+            let dictionary_result = transform_dictionary(state, obj_id, &mut stream.dict, direction);
+            // If the stream object specifies its own crypt filter, override the default one with the
+            // one from this stream object.  `Some(None)` means `/Crypt` without a usable name,
+            // i.e. Identity.
+            let crypt_filter = match crypt_filter_override(state, stream) {
+                Some(filter) => filter.unwrap_or_else(|| Arc::new(IdentityCryptFilter)),
+                None => state.get_stream_filter_for(stream.dict.has_type(b"EmbeddedFile")),
+            };
+            let content_result =
+                transform_payload(state, obj_id, &*crypt_filter, stream.content.as_slice(), direction).map(
+                    |transformed| {
+                        stream.set_content(transformed);
+                        // Decryption yields plaintext, so the Crypt filter has done its
+                        // job; dropping it lets the remaining filters decode the payload
+                        // (pdf.js keeps filtering after `Crypt`, parser.js:728-735).
+                        if matches!(direction, Direction::Decrypt) {
+                            strip_crypt_filter(stream);
+                        }
+                    },
+                );
+
+            content_result.and(dictionary_result)
+        }
+        // Encryption applies to all strings in the document's PDF file.
+        Object::String(content, _) => {
+            let transformed =
+                transform_payload(state, obj_id, &*state.get_string_filter(), content.as_slice(), direction)?;
+            *content = transformed.into();
+            Ok(())
+        }
         // Encryption is not applied to other object types such as integers and boolean values.
-        _ => {
-            return Ok(());
-        }
-    };
+        _ => Ok(()),
+    }
+}
 
-    // If the stream object specifies its own crypt filter, override the default one with the one
-    // from this stream object.  `Some(None)` means `/Crypt` without a usable name, i.e. Identity.
-    if let Some(filter) = override_crypt_filter {
-        crypt_filter = filter.unwrap_or_else(|| Arc::new(IdentityCryptFilter));
+/// Applies `transform_object` to every value of `dictionary`, except the
+/// `/Contents` of a signature dictionary.
+///
+/// A value that cannot be transformed does not leave the values after it
+/// untouched; the first error is returned once the dictionary is done.
+fn transform_dictionary(
+    state: &EncryptionState,
+    obj_id: ObjectId,
+    dictionary: &mut Dictionary,
+    direction: Direction,
+) -> Result<(), DecryptionError> {
+    // A signature dictionary's /Contents holds the PKCS#7 blob and
+    // must stay ciphertext (pdfium DecryptObjectTree,
+    // cpdf_crypto_handler.cpp:253-333).  Names are not encrypted, so
+    // /Type and /FT can be checked before recursing.
+    let signature = is_signature_dictionary(dictionary);
+    let mut first_error = None;
+    for (key, object) in dictionary.iter_mut() {
+        if signature && key.as_slice() == b"Contents" {
+            continue;
+        }
+        if let Err(error) = transform_object(state, obj_id, object, direction) {
+            first_error.get_or_insert(error);
+        }
     }
 
+    first_error.map_or(Ok(()), Err)
+}
+
+/// Runs one crypt filter over `payload`, deriving its key for `obj_id`.
+fn transform_payload(
+    state: &EncryptionState,
+    obj_id: ObjectId,
+    crypt_filter: &dyn CryptFilter,
+    payload: &[u8],
+    direction: Direction,
+) -> Result<Vec<u8>, DecryptionError> {
     // Compute the key from the original file encryption key and the object identifier to use for
     // the corresponding object.
     let key = crypt_filter.compute_key(&state.file_encryption_key, obj_id)?;
 
-    let transformed = match direction {
-        Direction::Encrypt => crypt_filter.encrypt(key.as_slice(), payload)?,
-        Direction::Decrypt => crypt_filter.decrypt(key.as_slice(), payload)?,
-    };
-
-    // Store the result in the object.
-    match obj {
-        Object::Stream(stream) => {
-            stream.set_content(transformed);
-            // Decryption yields plaintext, so the Crypt filter has done its
-            // job; dropping it lets the remaining filters decode the payload
-            // (pdf.js keeps filtering after `Crypt`, parser.js:728-735).
-            if matches!(direction, Direction::Decrypt) {
-                strip_crypt_filter(stream);
-            }
-        }
-        Object::String(content, _) => *content = transformed.into(),
-        _ => (),
+    match direction {
+        Direction::Encrypt => crypt_filter.encrypt(key.as_slice(), payload),
+        Direction::Decrypt => crypt_filter.decrypt(key.as_slice(), payload),
     }
-
-    Ok(())
 }
 
 /// The crypt filter named by the `/DecodeParms` entry belonging to the

@@ -88,12 +88,12 @@ fn encrypted_pdf() -> Vec<u8> {
 }
 
 #[test]
-#[ignore = "vendored reconstruction without a password differs"]
 fn an_encrypted_document_without_its_password_is_not_rebuilt() {
     let pdf = encrypted_pdf();
 
     // The counter sees a rebuild.
     let force = LoadOptions {
+        force_reconstruct: true,
         ..Default::default()
     };
     let (_, count) = reconstructions(|| Document::load_mem_with_options(&pdf, force));

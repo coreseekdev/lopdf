@@ -560,6 +560,9 @@ impl Document {
             .and_then(Object::as_reference)?;
 
         let mut state = EncryptionState::decode(&*self, password)?;
+        // One object that cannot be decrypted must not leave the rest of the
+        // document in ciphertext.  Continue, then report the first failure.
+        let mut first_error = None;
 
         for (&id, obj) in self.objects.iter_mut() {
             // The encryption dictionary is not encrypted, leave it alone
@@ -567,7 +570,9 @@ impl Document {
                 continue;
             }
 
-            encryption::decrypt_object(&state, id, obj)?;
+            if let Err(error) = encryption::decrypt_object(&state, id, obj) {
+                first_error.get_or_insert(error);
+            }
         }
 
         // Add the objects from the object streams now that they have been decrypted.
@@ -606,7 +611,7 @@ impl Document {
 
         self.encryption_state = Some(state);
 
-        Ok(())
+        first_error.map_or(Ok(()), |error| Err(error.into()))
     }
 
     /// Return the PDF document catalog, which is the root of the document's object graph.

@@ -124,7 +124,6 @@ mod sync_tests {
     /// `assets/encrypted.pdf` opens with an empty user password. Its embedded files are top-level
     /// streams and its fonts sit in object streams, so the filter has to run on both.
     #[test]
-    #[ignore = "vendored loader differs on strictness and encrypted filtering"]
     fn load_with_options_filter_on_encrypted_pdf() {
         fn has_type(obj: &Object, name: &[u8]) -> bool {
             let dict = match obj {
@@ -176,7 +175,6 @@ mod sync_tests {
     }
 
     #[test]
-    #[ignore = "vendored loader differs on strictness and encrypted filtering"]
     fn load_with_options_strict_true_loads_valid_pdf() {
         // strict=true should still load a valid, conforming PDF
         let doc = Document::load_with_options(

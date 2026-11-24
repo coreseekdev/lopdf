@@ -2,7 +2,6 @@ use super::DecryptionError;
 use super::pkcs5::Pkcs5;
 use super::rc4::Rc4;
 use crate::ObjectId;
-use aes::cipher::block_padding::NoPadding;
 use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
 use md5::{Digest as _, Md5};
 use rand::RngExt as _;
@@ -174,42 +173,27 @@ macro_rules! aes_cbc_crypt_filter {
                     .try_into()
                     .map_err(|_| DecryptionError::InvalidKeyLength)?;
 
-                // pdfium fails soft: a payload shorter than the IV decrypts
-                // to empty, a partial trailing block is ignored, and invalid
-                // PKCS#5 padding leaves the block unpadded rather than
-                // dropping the object (cpdf_crypto_handler.cpp:211-233,
-                // 301-304).
-                if ciphertext.len() < 16 {
-                    return Ok(vec![]);
+                // AES-CBC ciphertext is a whole number of blocks preceded by the
+                // IV (ISO 32000-1, 7.6.3.4).  Decrypting only the blocks that fit
+                // would turn a truncated or corrupt payload into silent junk.
+                if !ciphertext.len().is_multiple_of(16) {
+                    return Err(DecryptionError::InvalidCipherTextLength);
                 }
-                let blocks = (ciphertext.len() - 16) / 16;
-                if blocks == 0 {
+
+                // Nothing to decrypt when the payload is empty or holds only the IV.
+                if ciphertext.len() <= 16 {
                     return Ok(vec![]);
                 }
 
                 let mut iv = [0x00u8; 16];
                 iv.copy_from_slice(&ciphertext[..16]);
-                let aligned = &ciphertext[16..16 + blocks * 16];
 
-                if let Ok(plain) = <$dec>::new(key.into(), &iv.into())
-                    .decrypt_padded::<Pkcs5>(&mut aligned.to_vec())
-                {
-                    return Ok(plain.to_vec());
-                }
-
-                // Invalid padding: decrypt without removing any and drop the
-                // count only when it is a plausible 1..16 tail.
-                let mut plain = aligned.to_vec();
-                <$dec>::new(key.into(), &iv.into())
-                    .decrypt_padded::<NoPadding>(&mut plain)
-                    .map_err(|_| DecryptionError::Padding)?;
-                if let Some(&padding) = plain.last() {
-                    if padding > 0 && padding < 16 {
-                        let len = plain.len().saturating_sub(usize::from(padding));
-                        plain.truncate(len);
-                    }
-                }
-                Ok(plain)
+                // PKCS#5 padding is part of the AESV2 envelope (RFC 2898); a
+                // wrong key or corruption fails here instead of yielding junk.
+                Ok(<$dec>::new(key.into(), &iv.into())
+                    .decrypt_padded::<Pkcs5>(&mut ciphertext[16..].to_vec())
+                    .map_err(|_| DecryptionError::Padding)?
+                    .to_vec())
             }
         }
     };

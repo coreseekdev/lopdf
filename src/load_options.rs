@@ -49,6 +49,14 @@ pub struct LoadOptions {
     ///
     /// `None` (the default) applies no limit.
     pub max_decompressed_size: Option<usize>,
+    /// Rebuild the cross-reference table by scanning for indirect objects
+    /// before reading it, instead of trusting the stored table.
+    ///
+    /// Set this for a file whose offsets are known to be wrong, for example
+    /// after bytes were inserted or removed before the objects.  Defaults to
+    /// `false`; lenient loading still rebuilds when the stored table cannot be
+    /// used at all.
+    pub force_reconstruct: bool,
     /// Intern structurally identical dictionaries while loading.
     ///
     /// Form-heavy generators (notably TeX/PGF) can repeat the same large
@@ -66,6 +74,7 @@ impl std::fmt::Debug for LoadOptions {
             .field("filter", &self.filter.map(|_| "fn(..)"))
             .field("strict", &self.strict)
             .field("max_decompressed_size", &self.max_decompressed_size)
+            .field("force_reconstruct", &self.force_reconstruct)
             .field("intern_dictionaries", &self.intern_dictionaries)
             .finish()
     }
