@@ -114,7 +114,6 @@ fn explicit_identity_preserves_plaintext_when_loading() {
 }
 
 #[test]
-#[ignore = "vendored encryption writes Identity filter lists differently"]
 fn omitted_filter_names_preserve_plaintext_when_loading() {
     reading_preserves_identity(true);
 }
