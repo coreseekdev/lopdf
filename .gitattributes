@@ -7,3 +7,4 @@ Cargo.lock text
 *.jpg binary
 *.jpeg binary
 *.png binary
+*.bcmap    binary
