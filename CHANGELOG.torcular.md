@@ -269,3 +269,20 @@ Upstream: J-F-Liu/lopdf, pinned at the commit in `../../refs.lock`
   asserts the gap is skipped.  New tests reject `0x8000_0000` and
   `u32::MAX - 2`, and check that the last legal number saves as a classic
   table but fails cleanly as an xref stream.
+
+- `src/writer.rs`: `Object::Real` is written with a decimal point (`5.0`,
+  `0.0`, `-0.0`), as ISO 32000-1 7.3.3 requires, so a whole-number real
+  reloads as a real instead of an `Object::Integer`.  The digits come from
+  `Display` (shortest round-trip form, never an exponent); NaN and the
+  infinities keep their previous spelling.  Loading and saving no longer
+  change a real's type.  `tests/real_point.rs` is 6/6.
+
+- `src/writer.rs`: `save`, `save_to`, `save_with_options` and
+  `IncrementalDocument::save_to` no longer change `Document::trailer` or
+  `Document::max_id`.  The `/Size`, the cross-reference stream keys and the
+  `/Encrypt` entry a save needs are written into a copy of the trailer, and
+  object streams and the cross-reference stream take their numbers from a
+  counter copied from `max_id`.  Saving twice writes the same file, and
+  objects added after a save take the next number.  The PDF version is still
+  raised to 1.5 when the output needs it (`tests/xref_version.rs`).
+  `tests/save_keeps_document_state.rs` is 7/7.

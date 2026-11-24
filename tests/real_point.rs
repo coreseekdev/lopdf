@@ -76,7 +76,6 @@ fn written(object: &Object) -> String {
 }
 
 #[test]
-#[ignore = "vendored writer drops the point of whole-number reals"]
 fn a_real_is_written_with_its_point() {
     assert_eq!(written(&Object::Real(0.0)), "0.0");
     assert_eq!(written(&Object::Real(-0.0)), "-0.0");
@@ -89,7 +88,6 @@ fn a_real_is_written_with_its_point() {
 }
 
 #[test]
-#[ignore = "vendored writer drops the point of whole-number reals"]
 fn a_real_reloads_as_the_same_real() {
     for value in [0.0, -0.0, 5.0, 1e20, 0.1] {
         let value = Object::Real(value);
@@ -115,7 +113,6 @@ fn an_integer_is_still_written_as_an_integer() {
 }
 
 #[test]
-#[ignore = "vendored writer drops the point of whole-number reals"]
 fn an_incremental_update_writes_a_real_with_its_point() {
     let prev = saved(document_with(Object::Integer(1)));
     let loaded = Document::load_mem(&prev).unwrap();
@@ -135,7 +132,6 @@ fn an_incremental_update_writes_a_real_with_its_point() {
 }
 
 #[test]
-#[ignore = "vendored writer drops the point of whole-number reals"]
 fn a_content_stream_operand_keeps_its_point() {
     let content = Content {
         operations: vec![Operation::new(
