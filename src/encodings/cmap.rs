@@ -278,19 +278,24 @@ impl ToUnicodeCMap {
                     .map(|(range, value)| value_for_code(value, code, *range.start()))
             })
             .or_else(|| {
-                // Some CMaps declare a 1-byte codespace for fonts whose
-                // content streams paint 2-byte codes (pdfapi2 writes
-                // `<42> <5f>` for an Identity-H font; pdf.js keys the map by
-                // numeric value only, so code 0x0042 finds the 1-byte
-                // entry — pdf.js bug898853.pdf).
-                for (other, bucket) in self.bf_ranges.iter().enumerate() {
-                    if other == index {
-                        continue;
-                    }
+                // pdf.js keys ToUnicode entries by numeric code only, so a
+                // wider lookup may still resolve a narrower entry: some CMaps
+                // declare a 1-byte codespace for fonts whose content streams
+                // paint 2-byte codes (pdfapi2 writes `<42> <5f>` for an
+                // Identity-H font, and pdf.js bug898853.pdf relies on 0x0042
+                // finding the 1-byte entry).
+                //
+                // The reverse is never valid and must not happen: a lookup of
+                // N bytes describes the code the decoder actually consumed, so
+                // matching an entry declared for M > N bytes would resolve a
+                // code that was never read (and a range starting at 0 would
+                // emit a spurious NUL).  Only shorter declarations are
+                // considered here.
+                for other in 0..index {
                     if let Some(value) = self.single[other].get(&code) {
                         return Some(value_for_code(value, code, code));
                     }
-                    if let Some((range, value)) = bucket.get_key_value(&code) {
+                    if let Some((range, value)) = self.bf_ranges[other].get_key_value(&code) {
                         return Some(value_for_code(value, code, *range.start()));
                     }
                 }
@@ -727,7 +732,6 @@ end
     }
 
     #[test]
-    #[ignore = "vendored CMap lookup ignores the code length"]
     fn char_can_be_retrieved_only_by_appropriate_len() {
         let mut cmap = ToUnicodeCMap::new();
         let char_code = 0x1;

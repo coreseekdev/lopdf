@@ -411,18 +411,119 @@ fn cmap_stream(input: ParserInput) -> CMapResult<'_, ParsedCMap> {
 }
 
 #[cfg(test)]
-fn skip_metadata<'a>(input: ParserInput<'a>, key: &[u8]) -> CMapResult<'a, ()> {
-    let rest = input.strip_prefix(key).ok_or(CMapParseError::Error)?;
-    let (rest, _) = multispace0(rest)?;
-    let (rest, _) = next_token(rest)?;
-    let (rest, _) = multispace0(rest)?;
-    let rest = rest.strip_prefix(b"def").ok_or(CMapParseError::Error)?;
-    multispace1(rest)
+fn expect_word<'a>(input: ParserInput<'a>, word: &[u8]) -> CMapResult<'a, ()> {
+    let (rest, token) = next_token(input)?;
+    if token == word {
+        Ok((rest, ()))
+    } else {
+        Err(CMapParseError::Error)
+    }
+}
+
+/// Skips a single PostScript object: a dictionary, an array, a string, a hex
+/// string or a bare token.  Containers are matched as a whole so that a
+/// metadata value such as `<<...>>` or `[...]` is consumed in one step
+/// instead of one delimiter at a time.
+#[cfg(test)]
+fn skip_object(input: ParserInput) -> CMapResult<'_, ()> {
+    let (rest, _) = space0(input)?;
+    if let Some(rest) = rest.strip_prefix(b"<<") {
+        skip_until(rest, b">>")
+    } else if let Some(rest) = rest.strip_prefix(b"[") {
+        skip_until(rest, b"]")
+    } else {
+        let (rest, _) = next_token(rest)?;
+        Ok((rest, ()))
+    }
 }
 
 #[cfg(test)]
+fn skip_until<'a>(input: ParserInput<'a>, close: &'static [u8]) -> CMapResult<'a, ()> {
+    let mut rest = input;
+    loop {
+        let (after_space, _) = multispace0(rest)?;
+        if after_space.is_empty() {
+            return Err(CMapParseError::Incomplete);
+        }
+        if let Some(after_close) = after_space.strip_prefix(close) {
+            return Ok((after_close, ()));
+        }
+        let (next, _) = skip_object(after_space)?;
+        if next.len() == after_space.len() {
+            return Err(CMapParseError::Error);
+        }
+        rest = next;
+    }
+}
+
+/// Skips the `N dict dup begin ... end` constructor some producers emit for
+/// /CIDSystemInfo instead of the `<<...>>` literal (PostScript Language
+/// Reference: `dict`, `dup`, `begin`/`end`).
+#[cfg(test)]
+fn skip_dict_constructor(input: ParserInput) -> CMapResult<'_, ()> {
+    let digits = input
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if digits == 0 {
+        return Err(CMapParseError::Error);
+    }
+    let (rest, _) = space1(&input[digits..])?;
+    let (rest, _) = expect_word(rest, b"dict")?;
+    let (rest, _) = space1(rest)?;
+    let (rest, _) = expect_word(rest, b"dup")?;
+    let (rest, _) = space1(rest)?;
+    let (rest, _) = expect_word(rest, b"begin")?;
+    let (rest, _) = multispace1(rest)?;
+    let mut rest = rest;
+    loop {
+        let (after_space, _) = multispace0(rest)?;
+        if after_space.is_empty() {
+            return Err(CMapParseError::Incomplete);
+        }
+        let at_end = after_space.starts_with(b"end")
+            && after_space
+                .get(3)
+                .is_none_or(|byte| byte.is_ascii_whitespace() || is_token_delimiter(*byte));
+        if at_end {
+            return Ok((&after_space[3..], ()));
+        }
+        let (next, _) = skip_object(after_space)?;
+        if next.len() == after_space.len() {
+            return Err(CMapParseError::Error);
+        }
+        rest = next;
+    }
+}
+
+#[cfg(test)]
+fn skip_metadata<'a>(input: ParserInput<'a>, key: &[u8]) -> CMapResult<'a, ()> {
+    let rest = input.strip_prefix(key).ok_or(CMapParseError::Error)?;
+    let (rest, _) = multispace0(rest)?;
+    let (rest, _) = skip_object(rest)?;
+    let (rest, _) = multispace0(rest)?;
+    let (rest, _) = expect_word(rest, b"def")?;
+    multispace0(rest)
+}
+
+/// `/CIDSystemInfo` holds a dictionary with `Registry`, `Ordering` and
+/// `Supplement` entries (ISO 32000-1, 9.7.5.2; Adobe CMap specification,
+/// 1.4.1).  Either a literal dictionary or the `N dict dup begin ... end`
+/// constructor is accepted.
+#[cfg(test)]
 fn cid_system_info(input: ParserInput) -> CMapResult<'_, ()> {
-    skip_metadata(input, b"/CIDSystemInfo")
+    let rest = input
+        .strip_prefix(b"/CIDSystemInfo")
+        .ok_or(CMapParseError::Error)?;
+    let (rest, _) = multispace0(rest)?;
+    let (rest, _) = if rest.starts_with(b"<<") {
+        skip_object(rest)?
+    } else {
+        skip_dict_constructor(rest)?
+    };
+    let (rest, _) = multispace0(rest)?;
+    let (rest, _) = expect_word(rest, b"def")?;
+    multispace0(rest)
 }
 
 #[cfg(test)]
@@ -450,9 +551,41 @@ fn uidoffset(input: ParserInput) -> CMapResult<'_, ()> {
     skip_metadata(input, b"/UIDOffset")
 }
 
+/// `/XUID` is an array of non-negative integers (ISO 32000-1, 14.3.3;
+/// Adobe CMap specification, 1.4.1).  Reading it as an array — rather than
+/// a single token — keeps the integers of a following declaration from being
+/// mistaken for metadata values.
 #[cfg(test)]
 fn xuid(input: ParserInput) -> CMapResult<'_, ()> {
-    skip_metadata(input, b"/XUID")
+    let rest = input
+        .strip_prefix(b"/XUID")
+        .ok_or(CMapParseError::Error)?;
+    let (rest, _) = multispace0(rest)?;
+    let rest = rest.strip_prefix(b"[").ok_or(CMapParseError::Error)?;
+    let mut rest = rest;
+    let mut entries = 0usize;
+    loop {
+        let (after_space, _) = multispace0(rest)?;
+        if let Some(after_close) = after_space.strip_prefix(b"]") {
+            rest = after_close;
+            break;
+        }
+        if after_space.is_empty() {
+            return Err(CMapParseError::Incomplete);
+        }
+        let (next, token) = next_token(after_space)?;
+        if token.is_empty() || !token.iter().all(u8::is_ascii_digit) {
+            return Err(CMapParseError::Error);
+        }
+        entries += 1;
+        rest = next;
+    }
+    if entries == 0 {
+        return Err(CMapParseError::Error);
+    }
+    let (rest, _) = multispace0(rest)?;
+    let (rest, _) = expect_word(rest, b"def")?;
+    multispace0(rest)
 }
 
 #[cfg(test)]
@@ -644,7 +777,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "vendored CMap parser does not parse /CIDSystemInfo or /XUID"]
     fn parse_cid_system_info() {
         let data = b"/CIDSystemInfo <<
 /Registry (Adobe)
@@ -656,7 +788,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "vendored CMap parser does not parse /CIDSystemInfo or /XUID"]
     fn parse_cid_system_info_dict_dup() {
         let data = b"/CIDSystemInfo 3 dict dup begin
   /Registry (callas) def
@@ -668,7 +799,6 @@ end def
     }
 
     #[test]
-    #[ignore = "vendored CMap parser does not parse /CIDSystemInfo or /XUID"]
     fn parse_cid_system_info_with_spaces() {
         let data = b"/CIDSystemInfo
 << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n";
@@ -676,7 +806,6 @@ end def
     }
 
     #[test]
-    #[ignore = "vendored CMap parser does not parse /CIDSystemInfo or /XUID"]
     fn parse_cid_system_info_without_space_before_def() {
         let data = b"/CIDSystemInfo << /Registry(Adobe) /Ordering(UCS) /Supplement 0>>def\n";
         assert!(cid_system_info(test_span(data)).is_ok())
@@ -740,7 +869,6 @@ end
     }
 
     #[test]
-    #[ignore = "vendored CMap parser does not parse /CIDSystemInfo or /XUID"]
     fn parse_xuid() {
         let data = b"/XUID [1 10 25343] def\n";
         assert!(xuid(test_span(data)).is_ok())
