@@ -237,3 +237,35 @@ Upstream: J-F-Liu/lopdf, pinned at the commit in `../../refs.lock`
   +212 MB, and page content/fonts/images are fetched when a page is first
   rendered.  Encrypted documents are rejected by `read_shell` and fall back
   to the eager loader.
+
+- `src/parser/mod.rs`: stream `/Length` recovery is now spec-strict (ISO
+  32000-1 7.3.8.2).  Recovery runs only when a present `/Length` fails to
+  delimit the payload, and accepts exactly one EOL-framed `endstream` that is
+  followed by `endobj`; a missing, duplicated or truncated terminator drops
+  the object (strict mode aborts) instead of returning an empty stream.
+  Restores the semantics of upstream 675f451/#568;
+  `tests/stream_length_recovery.rs` is 9/9.
+
+- `src/object.rs`, `src/creator.rs`: new `MAX_OBJECT_NUMBER = 0x7FFF_FFFE`,
+  one below ISO 32000-2 7.3.10's `2^31 - 1` because `/Size = max_id + 1`
+  must still be a representable PDF integer.  Object headers and references
+  above it do not parse, `Document::try_new_object_id` / `try_add_object`
+  return `Error::ObjectIdOverflow`, and `add_object` / `new_object_id`
+  panic with the same message rather than wrapping.
+
+- `src/object_store.rs`, `src/xref.rs`: object and cross-reference tables are
+  now a dense `Vec` below `1 << 20` plus a `BTreeMap` above it.  A high
+  object number costs one entry instead of an allocation proportional to the
+  id; `len`, generations, ascending iteration and `IntoIterator` (including
+  rayon) keep their previous semantics.
+
+- `src/writer.rs`: cross-reference sections are built from the actual entries
+  (upstream 01d9bfb) instead of walking `1..=max_id`, so a sparse
+  high-numbered document saves quickly.  The cross-reference stream takes a
+  checked object number and `/Size` is computed in i64.
+
+- `tests/save_options_xref_streams_test.rs`: the high-id round-trip uses
+  `MAX_OBJECT_NUMBER - 1` (leaving one number for the xref stream) and
+  asserts the gap is skipped.  New tests reject `0x8000_0000` and
+  `u32::MAX - 2`, and check that the last legal number saves as a classic
+  table but fails cleanly as an xref stream.

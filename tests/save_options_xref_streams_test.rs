@@ -226,11 +226,13 @@ fn xref_table_free_entry_is_its_own_section_when_object_1_is_missing() {
 }
 
 /// Sections are built from the entries, so saving does not visit every number up to the
-/// highest object number. A document whose highest object number is close to `u32::MAX` used to
-/// take minutes to save in a debug build.
+/// highest object number, and a high number costs one entry rather than an allocation
+/// proportional to the id. The highest id used here leaves one number free for the
+/// cross-reference stream so the whole document stays within the PDF limit.
 #[test]
 fn xref_sections_skip_the_numbers_between_entries() {
-    let high = u32::MAX - 2;
+    let started = std::time::Instant::now();
+    let high = lopdf::MAX_OBJECT_NUMBER - 1;
     for use_xref_streams in [false, true] {
         let mut doc = Document::with_version("1.5");
         doc.reference_table.cross_reference_type = XrefType::CrossReferenceTable;
@@ -246,7 +248,24 @@ fn xref_sections_skip_the_numbers_between_entries() {
         let mut buffer = Vec::new();
         doc.save_with_options(&mut buffer, options).unwrap();
 
+        // A single `0..=high` section would make the file enormous; the gap
+        // must be skipped instead.
+        assert!(
+            buffer.len() < 64 * 1024,
+            "saved file is {} bytes, so the gap between entries was not skipped",
+            buffer.len()
+        );
+
         let reloaded = Document::load_mem(&buffer).unwrap();
+        // Object 0 may be listed free and an xref stream adds its own object,
+        // so a handful of entries is expected; a range spanning the gap would
+        // add billions.
+        assert!(
+            reloaded.reference_table.entries.len() <= 5,
+            "the gap between entries was expanded into {} xref entries",
+            reloaded.reference_table.entries.len()
+        );
+        assert!(reloaded.max_id >= high);
         for id in [1_u32, 2, high] {
             let marker = reloaded
                 .get_object((id, 0))
@@ -260,6 +279,69 @@ fn xref_sections_skip_the_numbers_between_entries() {
             assert_eq!(marker, id as i64, "object {id} resolved to the wrong entry");
         }
     }
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(60),
+        "saving a sparse high-id document took {:?}",
+        started.elapsed()
+    );
+}
+
+/// Allocating past the PDF object-number limit is an error, not a wrap to object 0
+/// and not an allocation proportional to the requested number.
+#[test]
+fn object_numbers_above_the_pdf_limit_are_rejected() {
+    for max_id in [lopdf::MAX_OBJECT_NUMBER, 0x8000_0000, u32::MAX - 2, u32::MAX] {
+        let mut doc = Document::with_version("1.5");
+        doc.max_id = max_id;
+
+        assert!(
+            matches!(doc.try_new_object_id(), Err(lopdf::Error::ObjectIdOverflow)),
+            "max_id {max_id} should not yield a new object id"
+        );
+        assert!(
+            matches!(
+                doc.try_add_object(dictionary! {}),
+                Err(lopdf::Error::ObjectIdOverflow)
+            ),
+            "max_id {max_id} should reject add_object"
+        );
+        assert!(doc.objects.is_empty());
+        assert_eq!(doc.max_id, max_id, "a rejected allocation must not move max_id");
+    }
+}
+
+/// A document whose highest object is the last legal number still saves with a
+/// classic table; a cross-reference stream has no number left, so that form
+/// must fail cleanly instead of wrapping or allocating.
+#[test]
+fn the_last_object_number_saves_with_a_table_but_not_a_stream() {
+    let mut doc = Document::with_version("1.5");
+    doc.reference_table.cross_reference_type = XrefType::CrossReferenceTable;
+    for id in [1_u32, lopdf::MAX_OBJECT_NUMBER] {
+        doc.objects.insert(
+            (id, 0),
+            Object::Dictionary(dictionary! { "Marker" => Object::Integer(id as i64) }),
+        );
+    }
+    doc.max_id = lopdf::MAX_OBJECT_NUMBER;
+
+    let mut table = Vec::new();
+    doc.save_to(&mut table).unwrap();
+    let reloaded = Document::load_mem(&table).unwrap();
+    assert_eq!(reloaded.max_id, lopdf::MAX_OBJECT_NUMBER);
+
+    let options = SaveOptions::builder().use_xref_streams(true).build();
+    let mut stream = Vec::new();
+    let err = doc
+        .save_with_options(&mut stream, options)
+        .expect_err("no object number is left for the cross-reference stream");
+    assert!(
+        matches!(
+            err.get_ref().and_then(|inner| inner.downcast_ref::<lopdf::Error>()),
+            Some(lopdf::Error::ObjectIdOverflow)
+        ),
+        "expected ObjectIdOverflow, got {err}"
+    );
 }
 
 /// A document with no objects still needs the mandatory `0 1` free subsection.

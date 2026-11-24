@@ -1,5 +1,5 @@
 use crate::Result;
-use crate::{Dictionary, Document, Object, ObjectId, PdfName};
+use crate::{Dictionary, Document, Error, MAX_OBJECT_NUMBER, Object, ObjectId, PdfName};
 #[cfg(feature = "font_embedding")]
 use crate::{FontData, Stream};
 
@@ -12,20 +12,58 @@ impl Document {
     }
 
     /// Create an object ID.
+    ///
+    /// # Panics
+    ///
+    /// Panics once no object number above [`Document::max_id`] is available.
+    /// Use [`Document::try_new_object_id`] to get an error instead.
     pub fn new_object_id(&mut self) -> ObjectId {
-        self.max_id += 1;
-        (self.max_id, 0)
+        self.try_new_object_id().unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    /// Create the next object ID, or return [`Error::ObjectIdOverflow`] when the
+    /// next number would exceed [`MAX_OBJECT_NUMBER`].
+    pub fn try_new_object_id(&mut self) -> Result<ObjectId> {
+        let next = self
+            .max_id
+            .checked_add(1)
+            .filter(|id| *id <= MAX_OBJECT_NUMBER)
+            .ok_or(Error::ObjectIdOverflow)?;
+        self.max_id = next;
+        Ok((next, 0))
     }
 
     /// Add PDF object into document's object list.
+    ///
+    /// # Panics
+    ///
+    /// Panics once no object number is available; see [`Document::try_add_object`].
     pub fn add_object<T: Into<Object>>(&mut self, object: T) -> ObjectId {
-        self.max_id += 1;
-        let id = (self.max_id, 0);
-        self.objects.insert(id, object.into());
-        id
+        self.try_add_object(object)
+            .unwrap_or_else(|err| panic!("{err}"))
     }
 
+    /// Add an object, returning [`Error::ObjectIdOverflow`] instead of panicking
+    /// when the object number limit has been reached.
+    pub fn try_add_object<T: Into<Object>>(&mut self, object: T) -> Result<ObjectId> {
+        let id = self.try_new_object_id()?;
+        self.objects.insert(id, object.into());
+        Ok(id)
+    }
+
+    /// Insert an object under an explicit id.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` is above [`MAX_OBJECT_NUMBER`]: such a number cannot be
+    /// expressed in a conforming cross-reference table.
     pub fn set_object<T: Into<Object>>(&mut self, id: ObjectId, object: T) {
+        assert!(
+            id.0 <= MAX_OBJECT_NUMBER,
+            "object ID {} exceeds the PDF limit of {}",
+            id.0,
+            MAX_OBJECT_NUMBER
+        );
         self.objects.insert(id, object.into());
     }
 

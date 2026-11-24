@@ -56,6 +56,15 @@ pub(crate) fn zlib_compress(content: &[u8], level: u32) -> Result<Vec<u8>> {
 /// Object identifier consists of two parts: object number and generation number.
 pub type ObjectId = (u32, u16);
 
+/// Highest object number this implementation accepts.
+///
+/// ISO 32000-2 7.3.10 caps object numbers at 2^31 - 1 (0x7FFF_FFFF). The
+/// cross-reference /Size is max_id + 1, however, and must itself be a
+/// representable PDF integer (<= 2^31 - 1), so an object numbered 2^31 - 1
+/// would force /Size = 2^31 and overflow that range. Reserving the top number
+/// keeps /Size = max_id + 1 inside the signed 32-bit range.
+pub const MAX_OBJECT_NUMBER: u32 = 0x7FFF_FFFE;
+
 /// The dictionary's insertion-ordered map.  PDF dictionaries are probed on
 /// every operator and resource lookup, and SipHash made byte-string keys the
 /// dominant cost when a page carries thousands of resources; Fx hashes the

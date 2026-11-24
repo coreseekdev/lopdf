@@ -88,7 +88,10 @@ impl Document {
             bytes_written: 0,
         };
 
-        let mut xref = Xref::new(self.max_id + 1, self.reference_table.cross_reference_type);
+        let mut xref = Xref::new(
+            self.max_id.saturating_add(1),
+            self.reference_table.cross_reference_type,
+        );
         writeln!(target, "%PDF-{}", self.version)?;
 
         Writer::write_binary_mark(&mut target, &self.binary_mark)?;
@@ -152,7 +155,10 @@ impl Document {
             bytes_written: 0,
         };
 
-        let mut xref = Xref::new(self.max_id + 1, self.reference_table.cross_reference_type);
+        let mut xref = Xref::new(
+            self.max_id.saturating_add(1),
+            self.reference_table.cross_reference_type,
+        );
         writeln!(target, "%PDF-{}", self.version)?;
         Writer::write_binary_mark(&mut target, &self.binary_mark)?;
 
@@ -205,10 +211,11 @@ impl Document {
             Writer::write_indirect_object(&mut target, id, generation, object, &mut xref)?;
         }
 
-        // Write object streams
-        let mut stream_count = 0;
+        // Write object streams. Each container takes its own object number,
+        // allocated through the checked path so a document already at the
+        // limit fails instead of wrapping onto object 0.
         for obj_stream in object_streams.into_iter() {
-            let stream_id = self.max_id + 1 + stream_count;
+            let (stream_id, _) = self.try_new_object_id().map_err(std::io::Error::other)?;
             let stream_obj = obj_stream
                 .to_stream_object()
                 .map_err(std::io::Error::other)?;
@@ -233,11 +240,7 @@ impl Document {
                 &Object::Stream(stream_obj),
                 &mut xref,
             )?;
-            stream_count += 1;
         }
-
-        // Update max_id to account for object streams
-        self.max_id += stream_count;
 
         let xref_start = target.bytes_written;
         self.write_xref_and_trailer(&mut target, &mut xref, xref_start)
@@ -253,9 +256,10 @@ impl Document {
         xref: &mut Xref,
         xref_start: u32,
     ) -> Result<()> {
-        // Increment max_id to account for CRS.
-        self.max_id += 1;
-        let new_obj_id_for_crs = self.max_id;
+        // Reserve an object number for the cross-reference stream itself.
+        let (new_obj_id_for_crs, _) = self
+            .try_new_object_id()
+            .map_err(std::io::Error::other)?;
         xref.insert(
             new_obj_id_for_crs,
             XrefEntry::Normal {
@@ -264,8 +268,9 @@ impl Document {
             },
         );
         self.trailer.set("Type", Name(b"XRef".to_vec().into()));
-        // Update `max_id` in trailer
-        self.trailer.set("Size", i64::from(self.max_id + 1));
+        // Update `max_id` in trailer. Compute `/Size` in i64 so it stays
+        // correct even for the highest representable object numbers.
+        self.trailer.set("Size", i64::from(self.max_id) + 1);
         // `[u8, u32, u16]` per entry (the PDF default is `[1 2 1]`).
         self.trailer
             .set("W", Array(vec![Integer(1), Integer(4), Integer(2)]));
@@ -298,7 +303,7 @@ impl Document {
     }
 
     fn write_trailer(&mut self, file: &mut dyn Write) -> Result<()> {
-        self.trailer.set("Size", i64::from(self.max_id + 1));
+        self.trailer.set("Size", i64::from(self.max_id) + 1);
         file.write_all(b"trailer\n")?;
         Writer::write_dictionary(file, &self.trailer)?;
         Ok(())
@@ -389,7 +394,7 @@ impl IncrementalDocument {
 
         // Write/Append new document version.
         let mut xref = Xref::new(
-            self.new_document.max_id + 1,
+            self.new_document.max_id.saturating_add(1),
             self.get_prev_documents()
                 .reference_table
                 .cross_reference_type,
@@ -495,26 +500,24 @@ impl Writer {
     /// one. Object 0 is left out; only a table has to invent an entry for it,
     /// and [`Self::write_xref`] is where that happens.
     fn xref_sections(xref: &Xref) -> Vec<XrefSection> {
-        let mut sections = Vec::new();
-        let mut current = XrefSection::new(0);
+        let mut sections: Vec<XrefSection> = Vec::new();
 
-        for obj_id in 1..=xref.max_id() {
-            if let Some(entry) = xref.get(obj_id) {
-                if current.is_empty() {
-                    current = XrefSection::new(obj_id);
+        // Walk the actual entries, not every number up to the highest id: a
+        // sparse document with a high object number would otherwise take
+        // minutes to save. Entries iterate in ascending object order.
+        for (&obj_id, entry) in xref.entries.iter().filter(|(id, _)| **id >= 1) {
+            match sections.last_mut() {
+                // No number is missing between the section and this entry. The
+                // sum cannot overflow: it is at most `obj_id`.
+                Some(section) if section.starting_id + section.entries.len() as u32 == obj_id => {
+                    section.add_entry(entry.clone());
                 }
-                current.add_entry(entry.clone());
-            } else {
-                // Skip over the gap, but close the section first if one is open.
-                if !current.is_empty() {
-                    sections.push(current);
-                    current = XrefSection::new(0);
+                _ => {
+                    let mut section = XrefSection::new(obj_id);
+                    section.add_entry(entry.clone());
+                    sections.push(section);
                 }
             }
-        }
-
-        if !current.is_empty() {
-            sections.push(current);
         }
 
         sections
@@ -566,8 +569,9 @@ impl Writer {
             // Add indexes to list
             xref_index.push(Integer(section.starting_id as i64));
             xref_index.push(Integer(section.entries.len() as i64));
-            // Add entries to stream
-            for (obj_id, entry) in (section.starting_id..).zip(section.entries) {
+            // Add entries to stream. An open-ended `starting_id..` range would
+            // overflow when it reaches `u32::MAX`.
+            for (obj_id, entry) in (section.starting_id..=u32::MAX).zip(section.entries) {
                 match entry {
                     XrefEntry::Free { generation } => {
                         // Type 0

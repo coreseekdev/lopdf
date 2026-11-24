@@ -1,6 +1,6 @@
 use log::warn;
 
-use crate::{Dictionary, Object, ObjectId, Stream, parser};
+use crate::{Dictionary, MAX_OBJECT_NUMBER, Object, ObjectId, Stream, parser};
 use crate::{
     Error, Result,
     content::{Content, Operation},
@@ -790,7 +790,11 @@ pub fn decode_xref_stream_with_limit(
                 // `start` is untrusted, as in a cross-reference table: `start + j` can overflow,
                 // and a `start` outside the u32 range would truncate into a valid-looking number.
                 if let Some(entry) = entry {
-                    match start.checked_add(j).and_then(|id| u32::try_from(id).ok()) {
+                    match start
+                        .checked_add(j)
+                        .and_then(|id| u32::try_from(id).ok())
+                        .filter(|id| *id <= MAX_OBJECT_NUMBER)
+                    {
                         Some(id) => xref.insert(id, entry),
                         None => skipped += 1,
                     }

@@ -1,10 +1,34 @@
 
+use std::collections::BTreeMap;
 use std::io::{Result, Write};
 
-/// Dense object-number indexed cross-reference entries.
+use crate::MAX_OBJECT_NUMBER;
+use crate::object_store::DENSE_LIMIT;
+
+type DenseRef<'a> = std::iter::FilterMap<
+    std::slice::Iter<'a, Option<(u32, XrefEntry)>>,
+    fn(&'a Option<(u32, XrefEntry)>) -> Option<(&'a u32, &'a XrefEntry)>,
+>;
+type StoreIter<'a> = std::iter::Chain<DenseRef<'a>, std::collections::btree_map::Iter<'a, u32, XrefEntry>>;
+type StoreIntoIter = std::iter::Chain<
+    std::iter::Flatten<std::vec::IntoIter<Option<(u32, XrefEntry)>>>,
+    std::collections::btree_map::IntoIter<u32, XrefEntry>,
+>;
+
+#[allow(clippy::needless_lifetimes)]
+fn dense_ref<'a>(entry: &'a Option<(u32, XrefEntry)>) -> Option<(&'a u32, &'a XrefEntry)> {
+    entry.as_ref().map(|(id, value)| (id, value))
+}
+
+/// Cross-reference entries indexed by object number.
+///
+/// Small ids use the same dense `Vec` as before; ids at or above
+/// [`DENSE_LIMIT`] live in a `BTreeMap` so a forged high id costs one entry
+/// instead of a multi-gigabyte allocation.  Iteration is still ascending.
 #[derive(Debug, Clone, Default)]
 pub struct XrefStore {
     entries: Vec<Option<(u32, XrefEntry)>>,
+    overflow: BTreeMap<u32, XrefEntry>,
     len: usize,
 }
 
@@ -13,11 +37,25 @@ impl XrefStore {
     pub fn len(&self) -> usize { self.len }
     pub fn is_empty(&self) -> bool { self.len == 0 }
     pub fn get(&self, id: &u32) -> Option<&XrefEntry> {
-        let entry = self.entries.get(*id as usize)?.as_ref()?;
-        (entry.0 == *id).then_some(&entry.1)
+        if *id >= DENSE_LIMIT {
+            self.overflow.get(id)
+        } else {
+            let entry = self.entries.get(*id as usize)?.as_ref()?;
+            (entry.0 == *id).then_some(&entry.1)
+        }
     }
     pub fn contains_key(&self, id: &u32) -> bool { self.get(id).is_some() }
     pub fn insert(&mut self, id: u32, entry: XrefEntry) {
+        // Object numbers above the PDF limit are not representable in a
+        // conforming file; dropping them keeps a forged id from inflating
+        // the table or allocating for it.
+        if id > MAX_OBJECT_NUMBER {
+            return;
+        }
+        if id >= DENSE_LIMIT {
+            if self.overflow.insert(id, entry).is_none() { self.len += 1; }
+            return;
+        }
         let index = id as usize;
         if self.entries.len() <= index {
             self.entries.resize_with(index + 1, || None);
@@ -26,6 +64,11 @@ impl XrefStore {
         self.entries[index] = Some((id, entry));
     }
     pub fn remove(&mut self, id: &u32) -> Option<XrefEntry> {
+        if *id >= DENSE_LIMIT {
+            let entry = self.overflow.remove(id)?;
+            self.len -= 1;
+            return Some(entry);
+        }
         let slot = self.entries.get_mut(*id as usize)?.take()?;
         if slot.0 != *id {
             self.entries[*id as usize] = Some(slot);
@@ -34,34 +77,41 @@ impl XrefStore {
         self.len -= 1;
         Some(slot.1)
     }
-    pub fn clear(&mut self) { self.entries.clear(); self.len = 0; }
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.overflow.clear();
+        self.len = 0;
+    }
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = (&u32, &XrefEntry)> {
-        self.entries.iter().filter_map(|entry| entry.as_ref().map(|(id, value)| (id, value)))
+        self.entries
+            .iter()
+            .filter_map(dense_ref as fn(_) -> _)
+            .chain(self.overflow.iter())
     }
     pub fn keys(&self) -> impl DoubleEndedIterator<Item = &u32> {
-        self.entries.iter().filter_map(|entry| entry.as_ref().map(|(id, _)| id))
+        self.iter().map(|(id, _)| id)
     }
     pub fn values(&self) -> impl DoubleEndedIterator<Item = &XrefEntry> {
-        self.entries.iter().filter_map(|entry| entry.as_ref().map(|(_, value)| value))
+        self.iter().map(|(_, value)| value)
     }
 }
 
 impl<'a> IntoIterator for &'a XrefStore {
     type Item = (&'a u32, &'a XrefEntry);
-    type IntoIter = std::iter::FilterMap<std::slice::Iter<'a, Option<(u32, XrefEntry)>>, fn(&'a Option<(u32, XrefEntry)>) -> Option<(&'a u32, &'a XrefEntry)>>;
+    type IntoIter = StoreIter<'a>;
     fn into_iter(self) -> Self::IntoIter {
-        fn entry<'a>(entry: &'a Option<(u32, XrefEntry)>) -> Option<(&'a u32, &'a XrefEntry)> {
-            entry.as_ref().map(|(id, value)| (id, value))
-        }
-        self.entries.iter().filter_map(entry)
+        self.entries
+            .iter()
+            .filter_map(dense_ref as fn(_) -> _)
+            .chain(self.overflow.iter())
     }
 }
 
 impl IntoIterator for XrefStore {
     type Item = (u32, XrefEntry);
-    type IntoIter = std::iter::Flatten<std::vec::IntoIter<Option<(u32, XrefEntry)>>>;
+    type IntoIter = StoreIntoIter;
     fn into_iter(self) -> Self::IntoIter {
-        self.entries.into_iter().flatten()
+        self.entries.into_iter().flatten().chain(self.overflow)
     }
 }
 
@@ -115,6 +165,11 @@ impl Xref {
     }
 
     pub fn insert(&mut self, id: u32, entry: XrefEntry) {
+        // Object numbers above the PDF limit cannot appear in a conforming
+        // file; dropping them keeps /Size representable and the store sparse.
+        if id > MAX_OBJECT_NUMBER {
+            return;
+        }
         self.entries.insert(id, entry);
         self.size = self.size.max(id.saturating_add(1));
     }
@@ -146,7 +201,7 @@ impl Xref {
     }
 
     pub fn max_id(&self) -> u32 {
-        match self.entries.keys().max() {
+        match self.entries.keys().next_back() {
             Some(&id) => id,
             None => 0,
         }
@@ -407,15 +462,21 @@ fn bytes_needed(value: u64) -> usize {
 #[cfg(feature = "rayon")]
 impl<'a> rayon::iter::IntoParallelIterator for &'a XrefStore {
     type Item = (&'a u32, &'a XrefEntry);
-    type Iter = rayon::iter::FilterMap<
-        rayon::slice::Iter<'a, Option<(u32, XrefEntry)>>,
-        fn(&'a Option<(u32, XrefEntry)>) -> Option<(&'a u32, &'a XrefEntry)>,
+    type Iter = rayon::iter::Chain<
+        rayon::iter::FilterMap<
+            rayon::slice::Iter<'a, Option<(u32, XrefEntry)>>,
+            fn(&'a Option<(u32, XrefEntry)>) -> Option<(&'a u32, &'a XrefEntry)>,
+        >,
+        rayon::collections::btree_map::Iter<'a, u32, XrefEntry>,
     >;
     fn into_par_iter(self) -> Self::Iter {
         use rayon::prelude::*;
+        #[allow(clippy::needless_lifetimes)]
         fn entry<'a>(entry: &'a Option<(u32, XrefEntry)>) -> Option<(&'a u32, &'a XrefEntry)> {
             entry.as_ref().map(|(id, value)| (id, value))
         }
-        self.entries.par_iter().filter_map(entry)
+        let entry = entry
+            as fn(&'a Option<(u32, XrefEntry)>) -> Option<(&'a u32, &'a XrefEntry)>;
+        self.entries.par_iter().filter_map(entry).chain(self.overflow.par_iter())
     }
 }

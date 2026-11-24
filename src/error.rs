@@ -92,6 +92,9 @@ pub enum Error {
     /// Numeric type cast failed.
     #[error("numberic type cast failed: {0}")]
     NumericCast(String),
+    /// No object number can be allocated: it would exceed [crate::MAX_OBJECT_NUMBER].
+    #[error("object ID overflow: no object number above the PDF limit is available")]
+    ObjectIdOverflow,
     /// Dereferencing object reached the limit.
     /// This might indicate a reference loop.
     #[error("dereferencing object reached limit, may indicate a reference cycle")]

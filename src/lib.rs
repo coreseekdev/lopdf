@@ -38,7 +38,9 @@ mod save_options;
 mod font;
 
 pub use document::Document;
-pub use object::{Dictionary, Object, ObjectId, PdfName, PdfString, Stream, StringFormat};
+pub use object::{
+    Dictionary, MAX_OBJECT_NUMBER, Object, ObjectId, PdfName, PdfString, Stream, StringFormat,
+};
 pub use object_store::ObjectStore;
 
 pub use bookmarks::Bookmark;

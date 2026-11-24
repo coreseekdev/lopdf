@@ -1,4 +1,4 @@
-use super::{Dictionary, Object, ObjectId, PdfName, PdfString, Reader, Stream, StringFormat};
+use super::{Dictionary, MAX_OBJECT_NUMBER, Object, ObjectId, PdfName, PdfString, Reader, Stream, StringFormat};
 use crate::Error;
 use crate::content::*;
 use crate::error;
@@ -76,14 +76,6 @@ pub(crate) fn comment(input: ParserInput) -> NomResult<()> {
 #[inline]
 fn is_whitespace(c: u8) -> bool {
     matches!(c, 0 | b'\t' | b'\n' | 0x0C | b'\r' | b' ')
-}
-
-#[inline]
-fn is_delimiter(c: u8) -> bool {
-    matches!(
-        c,
-        b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
-    )
 }
 
 /// PDF regular-character table; `name` scans it once per byte.
@@ -590,56 +582,68 @@ fn inner_dictionary(depth: usize) -> impl Fn(ParserInput) -> NomResult<Dictionar
     }
 }
 
-/// Recover the payload end from the first unambiguous terminator.
+/// Recover the sole unambiguous `endstream` fence for a stream whose
+/// declared `/Length` does not match its content.
 ///
-/// Accepted terminators are `endstream`, the misspellings pdf.js tolerates
-/// (`endsteam`, `endstrea`, parser.js:629-667), and a bare `endobj` when the
-/// producer omitted `endstream` altogether (pdfium `FindStreamEndPos`,
-/// cpdf_syntax_parser.cpp:742-775).  The caller passes only bytes up to the
-/// next xref-derived object start, so the scan cannot swallow a neighbour.
+/// ISO 32000-1 7.3.8.2: the stream bytes are exactly the `/Length` bytes
+/// between the EOL after `stream` and `endstream`, and only white-space may
+/// separate `endstream` from `endobj`.  A recovered boundary is therefore
+/// only trustworthy when a single EOL-framed `endstream` is immediately
+/// followed by `endobj`; zero candidates, a truncated scan window or more
+/// than one candidate are ambiguous and yield `None`.
+///
+/// The caller passes only bytes up to the next xref-derived object start, so
+/// the scan cannot swallow a neighbour.
 fn recover_stream_length(input: ParserInput) -> Option<(ParserInput, ParserInput)> {
     const ENDSTREAM: &[u8] = b"endstream";
-    const MISSPELLED: [&[u8]; 2] = [b"endsteam", b"endstrea"];
     const ENDOBJ: &[u8] = b"endobj";
 
-    let mut best: Option<(usize, usize)> = None;
-    for word in [ENDSTREAM, MISSPELLED[0], MISSPELLED[1], ENDOBJ] {
-        let Some(position) = input.windows(word.len()).position(|window| window == word) else {
+    let mut recovered: Option<(ParserInput, ParserInput)> = None;
+    for position in 0..input.len().saturating_sub(ENDSTREAM.len() - 1) {
+        if &input[position..position + ENDSTREAM.len()] != ENDSTREAM {
+            continue;
+        }
+
+        // The terminator must sit on its own line: the EOL belongs to it, not
+        // to the payload.
+        let data_end = if input[..position].ends_with(b"\r\n") {
+            position - 2
+        } else if input[..position].ends_with(b"\n") || input[..position].ends_with(b"\r") {
+            position - 1
+        } else {
             continue;
         };
-        let after = position + word.len();
-        let right_ok = match input.get(after).copied() {
-            None => true,
-            Some(byte) => {
-                if MISSPELLED.contains(&word) {
-                    // pdf.js requires whitespace after a corrupt
-                    // `endsteam`/`endstrea` to avoid false positives.
-                    byte.is_ascii_whitespace()
-                } else {
-                    byte.is_ascii_whitespace() || is_delimiter(byte)
-                }
+
+        // `endstream` has to be followed by white-space and `endobj`, and only
+        // white-space may follow `endobj` inside this object's slice.
+        let after_endstream = &input[position + ENDSTREAM.len()..];
+        let after_space = {
+            let mut index = 0;
+            while after_space_byte(after_endstream.get(index)) {
+                index += 1;
             }
+            &after_endstream[index..]
         };
-        if !right_ok {
+        let Some(after_endobj) = after_space.strip_prefix(ENDOBJ) else {
+            continue;
+        };
+        if after_endobj.first().is_some_and(|byte| !is_whitespace(*byte)) {
             continue;
         }
-        if best.is_none_or(|(best_position, _)| position < best_position) {
-            best = Some((position, word.len()));
+
+        // A second plausible fence makes the boundary ambiguous.
+        if recovered.is_some() {
+            return None;
         }
+        recovered = Some((after_endstream, &input[..data_end]));
     }
 
-    let (position, word_len) = best?;
-    // Trim the EOL that belongs to the terminator, not to the payload.
-    let data_end = if input[..position].ends_with(b"\r\n") {
-        position - 2
-    } else if input[..position].ends_with(b"\n") || input[..position].ends_with(b"\r") {
-        position - 1
-    } else {
-        // Damaged producers omit the EOL before `endstream` too; the unique
-        // whole-word terminator is still a usable recovery signal.
-        position
-    };
-    Some((&input[position + word_len..], &input[..data_end]))
+    recovered
+}
+
+#[inline]
+fn after_space_byte(byte: Option<&u8>) -> bool {
+    byte.is_some_and(|byte| is_whitespace(*byte))
 }
 
 #[inline]
@@ -697,46 +701,59 @@ fn stream<'a>(
     });
 
     if let Some(length) = declared_length {
-        if let Ok(length) = usize::try_from(length) {
-            if length <= i.len() {
-                let data = &i[..length];
-                let after = &i[length..];
-                if let Some(after) = after.strip_prefix(b"\r\n").or_else(|| after.strip_prefix(b"\n")).or_else(|| after.strip_prefix(b"\r")).or(Some(after)) {
-                    if let Some(remaining) = after.strip_prefix(b"endstream") {
-                        return Ok((remaining, Object::Stream(Stream::new(dict, data.to_vec()))));
-                    }
-                }
-            }
-        }
-    }
-
-    if recover_length && !reader.strict {
-        let scan_end = recovery_bound.map_or(i.len(), |bound| i.len().saturating_sub(bound));
-        match recover_stream_length(&i[..scan_end]) {
-            Some((remaining, data)) => {
-                if let Some(length) = declared_length {
-                    log::warn!(
-                        "Stream Length is {length}, but the object boundary gives {} bytes; using the recovered length.",
-                        data.len()
-                    );
-                }
-                Ok((remaining, Object::Stream(Stream::new(dict, data.to_vec()))))
-            }
-            None => Ok((
+        // ISO 32000-1 7.3.8.2: the payload is exactly `/Length` bytes and is
+        // followed by an optional EOL and `endstream`. A negative or
+        // unrepresentable length cannot delimit anything.
+        let Ok(length) = usize::try_from(length) else {
+            return Err(ParseErr::Failure(NomError::from_error_kind(
                 i,
-                Object::Stream(Stream::with_position(dict, input.len() - i.len())),
-            )),
+                ErrorKind::LengthValue,
+            )));
+        };
+
+        if length <= i.len() {
+            let data = &i[..length];
+            let after = &i[length..];
+            let after = after
+                .strip_prefix(b"\r\n")
+                .or_else(|| after.strip_prefix(b"\n"))
+                .or_else(|| after.strip_prefix(b"\r"))
+                .unwrap_or(after);
+            if let Some(remaining) = after.strip_prefix(b"endstream") {
+                return Ok((remaining, Object::Stream(Stream::new(dict, data.to_vec()))));
+            }
         }
-    } else if declared_length.is_none() {
-        Ok((
-            i,
-            Object::Stream(Stream::with_position(dict, input.len() - i.len())),
-        ))
-    } else {
+
+        if recover_length && !reader.strict {
+            // The scan is limited to the xref-derived object boundary so it
+            // cannot cross into a neighbour. Recovery only accepts the single
+            // unambiguous fence; anything else drops the object rather than
+            // guessing an empty payload (ISO 32000-1 7.3.8.2).
+            let scan_end = recovery_bound.map_or(i.len(), |bound| i.len().saturating_sub(bound));
+            let Some((remaining, data)) = recover_stream_length(&i[..scan_end]) else {
+                return Err(ParseErr::Failure(NomError::from_error_kind(
+                    i,
+                    ErrorKind::LengthValue,
+                )));
+            };
+            log::warn!(
+                "Stream Length is {length}, but the object boundary gives {} bytes; using the recovered length.",
+                data.len()
+            );
+            return Ok((remaining, Object::Stream(Stream::new(dict, data.to_vec()))));
+        }
+
         Err(ParseErr::Failure(NomError::from_error_kind(
             i,
             ErrorKind::LengthValue,
         )))
+    } else {
+        // No usable /Length: keep the lenient fallback (an empty stream at its
+        // data start) instead of guessing a boundary.
+        Ok((
+            i,
+            Object::Stream(Stream::with_position(dict, input.len() - i.len())),
+        ))
     }
 }
 
@@ -803,6 +820,15 @@ fn unsigned_int<I: UnsignedToken>(input: ParserInput) -> NomResult<I> {
 
 fn object_id(input: ParserInput) -> NomResult<ObjectId> {
     let (rest, number) = unsigned_int::<u32>(input)?;
+    if number > MAX_OBJECT_NUMBER {
+        // ISO 32000-2 7.3.10: object numbers above 2^31 - 1 are not valid,
+        // and this implementation reserves the top number so /Size stays
+        // representable. Reject instead of wrapping or allocating for it.
+        return Err(ParseErr::Error(NomError::from_error_kind(
+            input,
+            ErrorKind::TooLarge,
+        )));
+    }
     let (rest, _) = space(rest)?;
     let (rest, generation) = unsigned_int::<u16>(rest)?;
     let (rest, _) = space(rest)?;
@@ -857,12 +883,13 @@ fn try_direct_reference(input: ParserInput) -> Option<(ParserInput, Object)> {
     {
         return None;
     }
+    let number = u32::try_from(number).ok()?;
+    if number > MAX_OBJECT_NUMBER {
+        return None;
+    }
     Some((
         &input[index + 1..],
-        Object::Reference((
-            u32::try_from(number).ok()?,
-            u16::try_from(generation).ok()?,
-        )),
+        Object::Reference((number, u16::try_from(generation).ok()?)),
     ))
 }
 
@@ -1149,7 +1176,11 @@ fn xref(input: ParserInput, strict: bool) -> NomResult<Xref> {
                 Err(error) => return Err(error),
             };
             let ((offset, generation), is_normal) = entry;
-            let Some(id) = start.checked_add(index).and_then(|id| u32::try_from(id).ok()) else {
+            let Some(id) = start
+                .checked_add(index)
+                .and_then(|id| u32::try_from(id).ok())
+                .filter(|id| *id <= MAX_OBJECT_NUMBER)
+            else {
                 continue;
             };
             if is_normal {
@@ -2221,6 +2252,30 @@ pub fn content_strict(input: ParserInput) -> Result<Content<Vec<Operation>>, err
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn object_numbers_above_the_pdf_limit_do_not_parse() {
+        // 2^31 and u32::MAX - 2 are both outside ISO 32000-2 7.3.10's range and
+        // above this implementation's cap, so they must not become ObjectIds.
+        for text in [
+            &b"2147483648 0 obj"[..],
+            &b"4294967293 0 obj"[..],
+            &b"4294967295 0 R"[..],
+        ] {
+            assert!(
+                object_id(text).is_err(),
+                "an out-of-range object number parsed from {:?}",
+                String::from_utf8_lossy(text)
+            );
+            assert!(try_direct_reference(text).is_none());
+        }
+
+        // The highest accepted number still parses.
+        assert_eq!(
+            tstrip(object_id(b"2147483646 0")),
+            Some((2147483646, 0))
+        );
+    }
 
     fn test_span(s: &'_ [u8]) -> ParserInput<'_> {
         s
