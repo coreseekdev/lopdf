@@ -592,35 +592,40 @@ fn inner_dictionary(depth: usize) -> impl Fn(ParserInput) -> NomResult<Dictionar
 ///
 /// ISO 32000-1 7.3.8.2: the stream bytes are exactly the `/Length` bytes
 /// between the EOL after `stream` and `endstream`, and only white-space may
-/// separate `endstream` from `endobj`.  A recovered boundary is therefore
-/// only trustworthy when a single EOL-framed `endstream` is immediately
-/// followed by `endobj`; zero candidates, a truncated scan window or more
-/// than one candidate are ambiguous and yield `None`.
-///
-/// The caller passes only bytes up to the next xref-derived object start, so
-/// the scan cannot swallow a neighbour.
+/// separate `endstream` from `endobj` (7.2.2 makes any white-space a token
+/// separator, and some producers omit it entirely).  A recovered boundary is
+/// therefore only trustworthy when a single
+/// `endstream` is immediately followed by `endobj`; zero candidates or a
+/// truncated scan window yield `None`.  The first fence wins, because any
+/// later one lies after the object's `endobj`.
+
 fn recover_stream_length(input: ParserInput) -> Option<(ParserInput, ParserInput)> {
     const ENDSTREAM: &[u8] = b"endstream";
     const ENDOBJ: &[u8] = b"endobj";
 
-    let mut recovered: Option<(ParserInput, ParserInput)> = None;
     for position in 0..input.len().saturating_sub(ENDSTREAM.len() - 1) {
         if &input[position..position + ENDSTREAM.len()] != ENDSTREAM {
             continue;
         }
 
-        // The terminator must sit on its own line: the EOL belongs to it, not
-        // to the payload.
+        // ISO 32000-1 7.3.8.2 says there *should* be an EOL before
+        // endstream; 7.2.2 makes any white-space a token separator.  Some
+        // producers omit the separator entirely (form_object_with_text.pdf:
+        // "ETendstream") and some over-declare /Length with a space before
+        // endstream (bug_601362).  Strip one trailing EOL or white-space byte
+        // when present, otherwise end the payload at the keyword.
         let data_end = if input[..position].ends_with(b"\r\n") {
             position - 2
-        } else if input[..position].ends_with(b"\n") || input[..position].ends_with(b"\r") {
+        } else if input[..position]
+            .last()
+            .is_some_and(|byte| is_whitespace(*byte))
+        {
             position - 1
         } else {
-            continue;
+            position
         };
 
-        // `endstream` has to be followed by white-space and `endobj`, and only
-        // white-space may follow `endobj` inside this object's slice.
+        // `endstream` has to be followed by white-space and `endobj`.
         let after_endstream = &input[position + ENDSTREAM.len()..];
         let after_space = {
             let mut index = 0;
@@ -632,18 +637,20 @@ fn recover_stream_length(input: ParserInput) -> Option<(ParserInput, ParserInput
         let Some(after_endobj) = after_space.strip_prefix(ENDOBJ) else {
             continue;
         };
-        if after_endobj.first().is_some_and(|byte| !is_whitespace(*byte)) {
+        if after_endobj
+            .first()
+            .is_some_and(|byte| !is_whitespace(*byte))
+        {
             continue;
         }
 
-        // A second plausible fence makes the boundary ambiguous.
-        if recovered.is_some() {
-            return None;
-        }
-        recovered = Some((after_endstream, &input[..data_end]));
+        // The first fence wins: anything after its endobj belongs to the next
+        // object, and form_object_with_text.pdf carries a stray second
+        // "endstream endobj" pair after the real one.
+        return Some((after_endstream, &input[..data_end]));
     }
 
-    recovered
+    None
 }
 
 #[inline]
@@ -2291,6 +2298,65 @@ pub fn content_strict(input: ParserInput) -> Result<Content<Vec<Operation>>, err
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    #[test]
+    fn over_declared_length_recovers_with_a_space_before_endstream() {
+        // bug_601362.pdf: the content stream ends " EMC endstream" (a space,
+        // not an EOL) and /Length is 46 bytes too long.  ISO 32000-1 7.3.8.2
+        // only recommends the EOL; 7.2.2 lets any white-space separate the
+        // endstream token.
+        let input = b"%PDF-1.4\r\n\
+1 0 obj\r\n<< /Type /Catalog /Pages 2 0 R >>\r\nendobj\r\n\
+2 0 obj\r\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\r\nendobj\r\n\
+3 0 obj\r\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R >>\r\nendobj\r\n\
+6 0 obj << /Length 999 >> stream\r\nBT (Hi) Tj ET endstream\r\nendobj\r\n\
+trailer\r\n<< /Size 7 /Root 1 0 R >>\r\n%%EOF\r\n";
+        let document = crate::Document::load_mem(input).expect("lenient load");
+        let content = document
+            .get_object((6, 0))
+            .and_then(|object| object.as_stream().map(|stream| stream.content.clone()))
+            .expect("content stream");
+        assert_eq!(content, b"BT (Hi) Tj ET");
+    }
+
+
+    #[test]
+    fn stream_without_length_and_without_a_separator_before_endstream() {
+        // form_object_with_text.pdf: "...ETendstream" - no whitespace between
+        // the last operator and the keyword, and no /Length.
+        let input = b"%PDF-1.4\r\n\
+1 0 obj\r\n<< /Type /Catalog /Pages 2 0 R >>\r\nendobj\r\n\
+2 0 obj\r\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\r\nendobj\r\n\
+3 0 obj\r\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 6 0 R >>\r\nendobj\r\n\
+6 0 obj << /Type /XObject /Subtype /Form /BBox [0 0 200 200] >> stream\r\nBT (Hi) Tj ETendstream\r\nendobj\r\n\
+trailer\r\n<< /Size 7 /Root 1 0 R >>\r\n%%EOF\r\n";
+        let document = crate::Document::load_mem(input).expect("lenient load");
+        let content = document
+            .get_object((6, 0))
+            .and_then(|object| object.as_stream().map(|stream| stream.content.clone()))
+            .expect("content stream");
+        assert_eq!(content, b"BT (Hi) Tj ET");
+    }
+
+    #[test]
+    fn stream_recovery_takes_the_first_fence() {
+        // form_object_with_text.pdf carries a stray second
+        // "endstream endobj" pair after the real one; the first fence is the
+        // boundary and what follows belongs to the next object.
+        let input = b"%PDF-1.4\r\n\
+1 0 obj\r\n<< /Type /Catalog /Pages 2 0 R >>\r\nendobj\r\n\
+2 0 obj\r\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\r\nendobj\r\n\
+3 0 obj\r\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 6 0 R >>\r\nendobj\r\n\
+6 0 obj << /Type /XObject /Subtype /Form /BBox [0 0 200 200] >> stream\r\nBT (Hi) Tj ET\r\nendstream\r\nendobj\r\nendstream\r\nendobj\r\n\
+trailer\r\n<< /Size 7 /Root 1 0 R >>\r\n%%EOF\r\n";
+        let document = crate::Document::load_mem(input).expect("lenient load");
+        let content = document
+            .get_object((6, 0))
+            .and_then(|object| object.as_stream().map(|stream| stream.content.clone()))
+            .expect("content stream");
+        assert_eq!(content, b"BT (Hi) Tj ET");
+    }
 
     #[test]
     fn stream_without_length_recovers_from_endstream_fence() {
