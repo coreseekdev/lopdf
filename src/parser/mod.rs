@@ -753,8 +753,23 @@ fn stream<'a>(
             ErrorKind::LengthValue,
         )))
     } else {
-        // No usable /Length: keep the lenient fallback (an empty stream at its
-        // data start) instead of guessing a boundary.
+        // No usable /Length at all.  ISO 32000-1 7.3.8.2 makes /Length
+        // required, so this is a damaged stream.  Recover it only through the
+        // same unambiguous endstream+endobj fence used for a wrong /Length;
+        // the declaration being absent does not make an arbitrary scan
+        // trustworthy.
+        if recover_length && !reader.strict {
+            let scan_end = recovery_bound.map_or(i.len(), |bound| i.len().saturating_sub(bound));
+            if let Some((remaining, data)) = recover_stream_length(&i[..scan_end]) {
+                log::warn!(
+                    "Stream has no /Length; recovered {} bytes from the endstream fence.",
+                    data.len()
+                );
+                return Ok((remaining, Object::Stream(Stream::new(dict, data.to_vec()))));
+            }
+        }
+        // No fence: keep the lenient fallback (an empty stream at its data
+        // start) instead of guessing a boundary.
         Ok((
             i,
             Object::Stream(Stream::with_position(dict, input.len() - i.len())),
@@ -2276,6 +2291,28 @@ pub fn content_strict(input: ParserInput) -> Result<Content<Vec<Operation>>, err
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_without_length_recovers_from_endstream_fence() {
+        // A damaged PDF whose content stream has no /Length.  ISO 32000-1
+        // 7.3.8.2 makes /Length required, so this is recovery, and recovery
+        // only trusts the single EOL-framed endstream + endobj fence.
+        let input = b"%PDF-1.4\r\n\
+1 0 obj\r\n<< /Type /Catalog /Pages 2 0 R >>\r\nendobj\r\n\
+2 0 obj\r\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\r\nendobj\r\n\
+3 0 obj\r\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R >>\r\nendobj\r\n\
+6 0 obj<<\r\n>>stream\r\n0.5 g\r\nBT /F1 25 Tf 100 680 TD\r\n(ColorSpace: DeviceGray)Tj\r\nET\r\nendstream\r\nendobj\r\n\
+trailer\r\n<< /Size 7 /Root 1 0 R >>\r\n%%EOF\r\n";
+        let document = crate::Document::load_mem(input).expect("lenient load");
+        let content = document
+            .get_object((6, 0))
+            .and_then(|object| object.as_stream().map(|stream| stream.content.clone()))
+            .expect("content stream");
+        assert_eq!(
+            content,
+            b"0.5 g\r\nBT /F1 25 Tf 100 680 TD\r\n(ColorSpace: DeviceGray)Tj\r\nET"
+        );
+    }
 
     #[test]
     fn object_numbers_above_the_pdf_limit_do_not_parse() {
